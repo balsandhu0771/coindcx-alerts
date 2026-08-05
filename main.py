@@ -50,7 +50,7 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Daily Volume Filter)
+# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Daily Volume Filter & Deduplicated)
 # =============================================================
 exchange = ccxt.binance({
     "enableRateLimit": True,
@@ -65,7 +65,7 @@ def get_all_futures_tokens():
   try:
     markets = exchange.load_markets()
 
-    # Step 1: Extract map of raw Binance symbol IDs (e.g. "BTCUSDT") to CCXT symbols ("BTC/USDT")
+    # Step 1: Extract unique base symbol pairs to prevent alias duplication
     symbol_map = {}
     for symbol, market in markets.items():
       if (
@@ -75,41 +75,40 @@ def get_all_futures_tokens():
           and market.get("active", True)
       ):
         market_id = market.get("id")  # e.g., 'BTCUSDT'
-        if market_id:
-          symbol_map[market_id] = symbol
+        if market_id and symbol_map.get(market_id) is None:
+          # Prefer standard 'BTC/USDT' format over 'BTC/USDT:USDT'
+          if ":" not in symbol:
+            symbol_map[market_id] = symbol
 
     print(
-        f"Found {len(symbol_map)} active USDT futures markets. Fetching 24h"
-        " volume..."
+        f"Found {len(symbol_map)} unique active USDT futures markets. Fetching"
+        " 24h volume..."
     )
 
-    # Step 2: Directly query Binance Futures 24hr Ticker API (1 fast request, no CCXT symbol bugs)
+    # Step 2: Fetch 24h ticker data directly from Binance Futures
     raw_tickers = exchange.fapiPublicGetTicker24hr()
 
-    filtered_pairs = []
+    filtered_pairs = set()
     for item in raw_tickers:
       symbol_id = item.get("symbol")
       if symbol_id in symbol_map:
-        # quoteVolume represents total 24h USDT traded volume
         quote_vol = float(item.get("quoteVolume", 0.0) or 0.0)
 
+        # Enforce strict $5 Million USDT daily volume threshold
         if quote_vol >= MIN_DAILY_VOLUME:
-          filtered_pairs.append(symbol_map[symbol_id])
+          filtered_pairs.add(symbol_map[symbol_id])
 
+    filtered_list = list(filtered_pairs)
     print(
-        f"Watchlist ready: {len(filtered_pairs)} futures tokens met the > $5M"
-        " 24h volume filter."
+        f"Watchlist ready: {len(filtered_list)} unique futures tokens met >"
+        " $5M volume filter."
     )
 
-    # Fail-safe: If volume filter yields list, return it; otherwise return all pairs
-    if filtered_pairs:
-      return filtered_pairs
-
-    return list(symbol_map.values())
+    return filtered_list if filtered_list else list(symbol_map.values())
 
   except Exception as e:
     print(f"Error fetching volume tickers: {e}")
-    # Fail-safe: If direct API call fails, return all market symbols directly instead of dropping to 5
+    # Fail-safe: Return clean unique pairs without aliases if ticker API fails
     try:
       return [
           symbol
@@ -118,6 +117,7 @@ def get_all_futures_tokens():
           and market.get("linear")
           and market.get("quote") == "USDT"
           and market.get("active", True)
+          and ":" not in symbol
       ]
     except Exception:
       return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
