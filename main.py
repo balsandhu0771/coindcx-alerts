@@ -40,7 +40,7 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & WATCHLIST SETUP (Binance Feed for 4H Candles)
+# 3. EXCHANGE & WATCHLIST SETUP (Binance Feed)
 # =============================================================
 exchange = ccxt.binance({"enableRateLimit": True})
 TIMEFRAME = "4h"
@@ -67,26 +67,28 @@ def get_all_futures_tokens():
 # =============================================================
 def check_liquidity_sweep(symbol):
   try:
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=3)
-    if not ohlcv or len(ohlcv) < 3:
+    # Fetch 4 candles to evaluate the newly closed candle safely
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=4)
+    if not ohlcv or len(ohlcv) < 4:
       return False
 
-    prev_high = ohlcv[-2][2]
-    prev_low = ohlcv[-2][3]
+    # Candle -2 is the newly closed 4H candle; Candle -3 is the previous candle
+    prev_high = ohlcv[-3][2]
+    prev_low = ohlcv[-3][3]
 
-    curr_high = ohlcv[-1][2]
-    curr_low = ohlcv[-1][3]
-    curr_close = ohlcv[-1][4]
+    closed_high = ohlcv[-2][2]
+    closed_low = ohlcv[-2][3]
+    closed_close = ohlcv[-2][4]
 
     # 1. BEARISH SWEEP (SHORT)
-    if curr_high > prev_high and curr_close < prev_high:
+    if closed_high > prev_high and closed_close < prev_high:
       msg = (
           f"🚨 *BEARISH SWEEP ALERT (SHORT)* 🚨\n\n"
           f"*Token:* `{symbol}`\n"
           f"*Timeframe:* 4-Hour (IST Schedule)\n"
-          f"*Current Close:* `${curr_close}`\n"
-          f"*Swept High:* `${curr_high}` (Prev High: `${prev_high}`)\n\n"
-          f"💡 *Setup:* Price swept above previous 4H high but closed back"
+          f"*Closed Price:* `${closed_close}`\n"
+          f"*Swept High:* `${closed_high}` (Prev High: `${prev_high}`)\n\n"
+          f"💡 *Setup:* Price swept above previous 4H high and closed back"
           f" below it."
       )
       print(f"[MATCH SHORT] {symbol}")
@@ -95,16 +97,16 @@ def check_liquidity_sweep(symbol):
 
     # 2. BULLISH SWEEP (LONG) WITH PREV HIGH CAP
     elif (
-        (curr_low < prev_low)
-        and (curr_close > prev_low)
-        and (curr_close < prev_high)
+        (closed_low < prev_low)
+        and (closed_close > prev_low)
+        and (closed_close < prev_high)
     ):
       msg = (
           f"🚨 *BULLISH SWEEP ALERT (LONG)* 🚨\n\n"
           f"*Token:* `{symbol}`\n"
           f"*Timeframe:* 4-Hour (IST Schedule)\n"
-          f"*Current Close:* `${curr_close}`\n"
-          f"*Swept Low:* `${curr_low}` (Prev Low: `${prev_low}`)\n"
+          f"*Closed Price:* `${closed_close}`\n"
+          f"*Swept Low:* `${closed_low}` (Prev Low: `${prev_low}`)\n"
           f"*Prev High Cap:* `${prev_high}`\n\n"
           f"💡 *Setup:* Price swept below previous 4H low, reclaimed above it,"
           f" and closed below previous high."
@@ -129,12 +131,12 @@ def run_full_scan():
     matched = check_liquidity_sweep(symbol)
     if matched:
       alerts_triggered += 1
-    time.sleep(0.15)  # Pause to avoid rate limits
+    time.sleep(0.12)  # Safe rate limit delay
 
   summary_msg = (
       f"🔍 *4H Scheduled Scan Complete*\n"
       f"• *Tokens Checked:* `{len(watchlist)}`\n"
-      f"• *Sweep Alerts Found:* `{alerts_triggered}`"
+      f"• *Sweep Setups Found:* `{alerts_triggered}`"
   )
   send_telegram_alert(summary_msg)
   print("Scan complete across all tokens!")
