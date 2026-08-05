@@ -51,7 +51,7 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Volume Filter)
+# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Daily Volume Filter)
 # =============================================================
 exchange = ccxt.binance({
     "enableRateLimit": True,
@@ -59,54 +59,55 @@ exchange = ccxt.binance({
     "options": {"defaultType": "future"},  # Loads USDT-M Futures markets
 })
 TIMEFRAME = "4h"
-MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Volume Threshold
+MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Daily Volume Threshold
 
 
 def get_all_futures_tokens():
   try:
     markets = exchange.load_markets()
 
-    # Step 1: Filter active USDT linear futures trading pairs
-    all_pairs = [
-        symbol
-        for symbol, market in markets.items()
-        if market.get("swap")
-        and market.get("linear")
-        and market.get("quote") == "USDT"
-        and market.get("active", True)
-    ]
+    # Get single bulk ticker call for fast volume filtering
+    tickers = exchange.fetch_tickers()
 
-    # Step 2: Fetch 24h tickers explicitly passing params for futures
-    try:
-      tickers = exchange.fetch_tickers(params={"type": "future"})
-      filtered_pairs = []
+    filtered_pairs = []
 
-      for symbol in all_pairs:
-        ticker = tickers.get(symbol, {})
-        # Extract 24-hour USDT quote volume
+    for symbol, market in markets.items():
+      # Filter for active USDT linear futures pairs
+      if (
+          market.get("swap")
+          and market.get("linear")
+          and market.get("quote") == "USDT"
+          and market.get("active", True)
+      ):
+
+        ticker = tickers.get(symbol) or tickers.get(market.get("id")) or {}
+
+        # 1. Try standard CCXT quote volume (USDT)
         quote_vol = ticker.get("quoteVolume", 0) or 0
 
+        # 2. If quoteVolume is missing/raw, calculate: baseVolume * lastPrice
+        if not quote_vol or quote_vol < 100_000:
+          base_vol = ticker.get("baseVolume", 0) or 0
+          last_price = ticker.get("last", 0) or 0
+          quote_vol = base_vol * last_price
+
+        # Enforce the strict $5,000,000 USDT filter
         if quote_vol >= MIN_DAILY_VOLUME:
           filtered_pairs.append(symbol)
 
-      print(
-          f"Filtered Watchlist: {len(filtered_pairs)} futures tokens meet >"
-          " $5M Volume rule."
-      )
-      if filtered_pairs:
-        return filtered_pairs
+    print(
+        f"Filtered Watchlist: {len(filtered_pairs)} futures tokens met the >"
+        " $5M Volume rule."
+    )
 
-    except Exception as ticker_err:
-      print(
-          f"Could not fetch bulk volume tickers ({ticker_err}), scanning all"
-          " active futures pairs instead."
-      )
-      return all_pairs  # Returns all ~300+ pairs if ticker filtering fails
+    if filtered_pairs:
+      return filtered_pairs
 
-    return all_pairs
+    print("Warning: Volume filter returned 0 tokens, using top liquid pairs.")
+    return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
 
   except Exception as e:
-    print(f"Error loading market list: {e}")
+    print(f"Error loading volume tickers: {e}")
     return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
 
 
