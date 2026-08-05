@@ -66,38 +66,47 @@ def get_all_futures_tokens():
   try:
     markets = exchange.load_markets()
 
-    # Step 1: Get single bulk ticker response for fast volume filtering
-    tickers = exchange.fetch_tickers()
+    # Step 1: Filter active USDT linear futures trading pairs
+    all_pairs = [
+        symbol
+        for symbol, market in markets.items()
+        if market.get("swap")
+        and market.get("linear")
+        and market.get("quote") == "USDT"
+        and market.get("active", True)
+    ]
 
-    filtered_pairs = []
-    for symbol, market in markets.items():
-      # Check if active USDT linear futures market
-      if (
-          market.get("swap")
-          and market.get("linear")
-          and market.get("quote") == "USDT"
-          and market.get("active", True)
-      ):
+    # Step 2: Fetch 24h tickers explicitly passing params for futures
+    try:
+      tickers = exchange.fetch_tickers(params={"type": "future"})
+      filtered_pairs = []
 
+      for symbol in all_pairs:
         ticker = tickers.get(symbol, {})
-        # Extracts 24-hour USDT quote volume
+        # Extract 24-hour USDT quote volume
         quote_vol = ticker.get("quoteVolume", 0) or 0
 
         if quote_vol >= MIN_DAILY_VOLUME:
           filtered_pairs.append(symbol)
 
-    print(
-        f"Filtered Watchlist: {len(filtered_pairs)} futures tokens meet > $5M"
-        " Volume rule."
-    )
+      print(
+          f"Filtered Watchlist: {len(filtered_pairs)} futures tokens meet >"
+          " $5M Volume rule."
+      )
+      if filtered_pairs:
+        return filtered_pairs
 
-    if filtered_pairs:
-      return filtered_pairs
+    except Exception as ticker_err:
+      print(
+          f"Could not fetch bulk volume tickers ({ticker_err}), scanning all"
+          " active futures pairs instead."
+      )
+      return all_pairs  # Returns all ~300+ pairs if ticker filtering fails
 
-    return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
+    return all_pairs
 
   except Exception as e:
-    print(f"Error loading market list or volume tickers: {e}")
+    print(f"Error loading market list: {e}")
     return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
 
 
