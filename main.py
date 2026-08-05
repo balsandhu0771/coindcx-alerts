@@ -23,8 +23,8 @@ def trigger_manual_scan():
   # Starts full scan in background thread
   threading.Thread(target=run_full_scan, daemon=True).start()
   return (
-      "Manual 4H market scan (with $5M Volume Filter) started! Check Telegram"
-      " in 2 minutes.",
+      "Manual 4H market scan (with $5M Volume Filter & Double-Sweep Filter)"
+      " started! Check Telegram in 2 minutes.",
       200,
   )
 
@@ -66,7 +66,7 @@ def get_all_futures_tokens():
   try:
     markets = exchange.load_markets()
 
-    # Step 1: Get single bulk ticker response for volume filtering in 1 call
+    # Step 1: Get single bulk ticker response for fast volume filtering
     tickers = exchange.fetch_tickers()
 
     filtered_pairs = []
@@ -102,7 +102,7 @@ def get_all_futures_tokens():
 
 
 # =============================================================
-# 4. SWEEP PATTERN DETECTION LOGIC
+# 4. SWEEP PATTERN DETECTION LOGIC (WITH DOUBLE SWEEP FILTER)
 # =============================================================
 def check_liquidity_sweep(symbol):
   try:
@@ -118,6 +118,11 @@ def check_liquidity_sweep(symbol):
     closed_high = ohlcv[-2][2]
     closed_low = ohlcv[-2][3]
     closed_close = ohlcv[-2][4]
+
+    # --- FILTER: IGNORE CANDLES THAT SWEEP BOTH HIGH AND LOW ---
+    if (closed_high > prev_high) and (closed_low < prev_low):
+      print(f"[SKIP] Double sweep (both high & low swept) on {symbol}")
+      return False
 
     # 1. BEARISH SWEEP (SHORT)
     if closed_high > prev_high and closed_close < prev_high:
