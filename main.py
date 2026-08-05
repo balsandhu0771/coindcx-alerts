@@ -50,7 +50,7 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Daily Volume Filter & Deduplicated)
+# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Daily Volume Filter)
 # =============================================================
 exchange = ccxt.binance({
     "enableRateLimit": True,
@@ -58,15 +58,15 @@ exchange = ccxt.binance({
     "options": {"defaultType": "future"},  # USD-M Futures
 })
 TIMEFRAME = "4h"
-MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Volume Threshold
+MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Daily Volume Threshold
 
 
 def get_all_futures_tokens():
   try:
     markets = exchange.load_markets()
 
-    # Step 1: Extract unique base symbol pairs to prevent alias duplication
-    symbol_map = {}
+    # Step 1: Extract standard, unique active USDT linear futures pairs
+    futures_symbols = []
     for symbol, market in markets.items():
       if (
           market.get("swap")
@@ -74,53 +74,54 @@ def get_all_futures_tokens():
           and market.get("quote") == "USDT"
           and market.get("active", True)
       ):
-        market_id = market.get("id")  # e.g., 'BTCUSDT'
-        if market_id and symbol_map.get(market_id) is None:
-          # Prefer standard 'BTC/USDT' format over 'BTC/USDT:USDT'
-          if ":" not in symbol:
-            symbol_map[market_id] = symbol
+        # Exclude internal alias variations like 'BTC/USDT:USDT'
+        if ":" not in symbol:
+          futures_symbols.append(symbol)
 
-    print(
-        f"Found {len(symbol_map)} unique active USDT futures markets. Fetching"
-        " 24h volume..."
-    )
+    if not futures_symbols:
+      futures_symbols = [
+          s
+          for s, m in markets.items()
+          if m.get("quote") == "USDT" and ":" not in s
+      ]
 
-    # Step 2: Fetch 24h ticker data directly from Binance Futures
-    raw_tickers = exchange.fapiPublicGetTicker24hr()
+    print(f"Found {len(futures_symbols)} unique active USDT futures markets.")
 
-    filtered_pairs = set()
-    for item in raw_tickers:
-      symbol_id = item.get("symbol")
-      if symbol_id in symbol_map:
-        quote_vol = float(item.get("quoteVolume", 0.0) or 0.0)
+    # Step 2: Fetch 24h volume data cleanly
+    try:
+      tickers = exchange.fetch_tickers()
+      filtered_list = []
 
-        # Enforce strict $5 Million USDT daily volume threshold
+      for symbol in futures_symbols:
+        ticker = tickers.get(symbol, {})
+        quote_vol = ticker.get("quoteVolume") or 0.0
+
+        # Calculate volume if quoteVolume is empty
+        if not quote_vol or quote_vol < 1000:
+          base_vol = ticker.get("baseVolume") or 0.0
+          last_price = ticker.get("last") or 0.0
+          quote_vol = base_vol * last_price
+
         if quote_vol >= MIN_DAILY_VOLUME:
-          filtered_pairs.add(symbol_map[symbol_id])
+          filtered_list.append(symbol)
 
-    filtered_list = list(filtered_pairs)
-    print(
-        f"Watchlist ready: {len(filtered_list)} unique futures tokens met >"
-        " $5M volume filter."
-    )
+      print(
+          f"Watchlist ready: {len(filtered_list)} tokens met > $5M volume"
+          " filter."
+      )
 
-    return filtered_list if filtered_list else list(symbol_map.values())
+      if filtered_list:
+        return filtered_list
+
+    except Exception as ticker_err:
+      print(f"Ticker filter warning ({ticker_err}), scanning all futures pairs.")
+
+    # Return clean full list if volume filtering encounters any issue
+    return futures_symbols
 
   except Exception as e:
-    print(f"Error fetching volume tickers: {e}")
-    # Fail-safe: Return clean unique pairs without aliases if ticker API fails
-    try:
-      return [
-          symbol
-          for symbol, market in exchange.markets.items()
-          if market.get("swap")
-          and market.get("linear")
-          and market.get("quote") == "USDT"
-          and market.get("active", True)
-          and ":" not in symbol
-      ]
-    except Exception:
-      return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
+    print(f"Error loading market list: {e}")
+    return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
 
 
 # =============================================================
