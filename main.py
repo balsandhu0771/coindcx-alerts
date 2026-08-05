@@ -128,10 +128,14 @@ def run_full_scan():
 
   alerts_triggered = 0
   for symbol in watchlist:
-    matched = check_liquidity_sweep(symbol)
-    if matched:
-      alerts_triggered += 1
-    time.sleep(0.12)  # Safe rate limit delay
+    try:
+      matched = check_liquidity_sweep(symbol)
+      if matched:
+        alerts_triggered += 1
+      time.sleep(0.15)  # Safe rate limit delay
+    except Exception as e:
+      print(f"Error in scanning loop for {symbol}: {e}")
+      time.sleep(0.5)
 
   summary_msg = (
       f"🔍 *4H Scheduled Scan Complete*\n"
@@ -157,7 +161,7 @@ def start_scheduler():
 
   while True:
     now_ist = datetime.now(IST)
-    current_slot = now_ist.strftime("%H:%M")
+    current_time_str = now_ist.strftime("%H:%M")
 
     target_times = [
         "01:30",
@@ -170,7 +174,12 @@ def start_scheduler():
 
     in_target_window = False
     for target in target_times:
-      if current_slot == target:
+      target_hour, target_minute = map(int, target.split(":"))
+      # Check if current time is within 2 minutes of the target slot
+      if (
+          now_ist.hour == target_hour
+          and abs(now_ist.minute - target_minute) <= 2
+      ):
         in_target_window = True
         if last_executed_slot != target:
           run_full_scan()
