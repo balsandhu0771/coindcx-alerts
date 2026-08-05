@@ -62,66 +62,99 @@ MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Daily Volume Threshold
 
 def get_all_futures_tokens():
   try:
-    markets = exchange.load_markets()
+    # Always force reload of market structure
+    markets = exchange.load_markets(True)
 
-    # Step 1: Extract all active USDT linear futures pairs (standard format only)
-    all_futures = [
+    # Step 1: Filter active USDT futures trading pairs (exclude alias pairs containing ':')
+    futures_symbols = [
         symbol
         for symbol, market in markets.items()
         if market.get("quote") == "USDT"
-        and market.get("swap")
         and market.get("active", True)
         and ":" not in symbol
     ]
 
-    print(f"Loaded {len(all_futures)} active USDT futures pairs.")
+    print(
+        f"Loaded {len(futures_symbols)} active USDT futures pairs from"
+        " exchange."
+    )
 
-    # Step 2: Try volume filtering safely per market info
+    if not futures_symbols:
+      # Secondary extraction fallback if active flag filtering was too strict
+      futures_symbols = [
+          symbol
+          for symbol, market in markets.items()
+          if market.get("quote") == "USDT" and ":" not in symbol
+      ]
+
+    # Step 2: Safe Volume Filtering via direct API request
     filtered_list = []
-    for symbol in all_futures:
-      try:
-        market = markets[symbol]
-        info = market.get("info", {})
-        # Read 24h volume from raw market metadata if present
-        quote_vol = float(
-            info.get("quoteVolume") or info.get("volume") or 0.0
-        )
+    try:
+      raw_tickers = exchange.public_get_ticker_24hr()
+      # Build quick lookup dictionary for 24h quote volume (USDT)
+      vol_lookup = {
+          item["symbol"]: float(item.get("quoteVolume", 0.0) or 0.0)
+          for item in raw_tickers
+          if "symbol" in item
+      }
 
-        if quote_vol >= MIN_DAILY_VOLUME:
+      for symbol in futures_symbols:
+        market_id = markets[symbol].get("id")
+        vol = vol_lookup.get(market_id, 0.0)
+
+        if vol >= MIN_DAILY_VOLUME or vol == 0.0:
           filtered_list.append(symbol)
-        elif quote_vol == 0:
-          # If volume metadata is missing, keep symbol in list to be safe
-          filtered_list.append(symbol)
-      except Exception:
-        filtered_list.append(symbol)
 
-    print(f"Watchlist ready: {len(filtered_list)} unique tokens selected.")
+      print(
+          f"Watchlist ready: {len(filtered_list)} unique tokens met volume"
+          " threshold."
+      )
 
-    # Return filtered list if valid; otherwise return all ~300+ futures pairs
-    return filtered_list if len(filtered_list) > 20 else all_futures
+      if filtered_list:
+        return filtered_list
+
+    except Exception as vol_err:
+      print(
+          f"Volume filtering error ({vol_err}), defaulting to full futures"
+          " market list."
+      )
+
+    return futures_symbols
 
   except Exception as e:
     print(f"Error loading market list: {e}")
-    # Fail-safe: Return all active futures from memory if available
+    # Fail-safe backup: fetch live ticker symbols directly via HTTP fallback
     try:
-      return [
-          symbol
-          for symbol, market in exchange.markets.items()
-          if market.get("quote") == "USDT" and ":" not in symbol
-      ]
-    except Exception:
-      return [
-          "BTC/USDT",
-          "ETH/USDT",
-          "SOL/USDT",
-          "XRP/USDT",
-          "ADA/USDT",
-          "DOGE/USDT",
-          "AVAX/USDT",
-          "NEAR/USDT",
-          "SUI/USDT",
-          "LINK/USDT",
-      ]
+      raw_tickers = requests.get(
+          "https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10
+      ).json()
+      fallback_pairs = []
+      for item in raw_tickers:
+        sym = item.get("symbol", "")
+        quote_vol = float(item.get("quoteVolume", 0.0) or 0.0)
+        if sym.endswith("USDT") and quote_vol >= MIN_DAILY_VOLUME:
+          # Convert 'BTCUSDT' to CCXT format 'BTC/USDT'
+          base = sym[:-4]
+          fallback_pairs.append(f"{base}/USDT")
+
+      if fallback_pairs:
+        return fallback_pairs
+    except Exception as fallback_err:
+      print(f"HTTP fallback error: {fallback_err}")
+
+    # Final guaranteed list if all network calls fail
+    return [
+        "BTC/USDT",
+        "ETH/USDT",
+        "SOL/USDT",
+        "XRP/USDT",
+        "ADA/USDT",
+        "DOGE/USDT",
+        "AVAX/USDT",
+        "NEAR/USDT",
+        "SUI/USDT",
+        "LINK/USDT",
+    ]
 
 
 # =============================================================
