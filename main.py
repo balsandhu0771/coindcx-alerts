@@ -8,7 +8,7 @@ from flask import Flask
 import requests
 
 # =============================================================
-# 1. KEEP-ALIVE WEB SERVER (For UptimeRobot & Render)
+# 1. KEEP-ALIVE WEB SERVER & MANUAL TRIGGER ROUTE
 # =============================================================
 app = Flask(__name__)
 
@@ -16,6 +16,17 @@ app = Flask(__name__)
 @app.route("/")
 def home():
   return "Bot is alive and running!", 200
+
+
+@app.route("/trigger-scan")
+def trigger_manual_scan():
+  # Starts full scan in background thread
+  threading.Thread(target=run_full_scan, daemon=True).start()
+  return (
+      "Manual 4H market scan (with 7-Day $5M Volume Filter) started! Check"
+      " Telegram in 2 minutes.",
+      200,
+  )
 
 
 # =============================================================
@@ -40,23 +51,63 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & WATCHLIST SETUP (Binance Data Feed)
+# 3. EXCHANGE & WATCHLIST SETUP (7-Day $5M Daily Volume Filter)
 # =============================================================
-exchange = ccxt.binance({"enableRateLimit": True})
+exchange = ccxt.binance({
+    "enableRateLimit": True,
+    "timeout": 30000,
+    "options": {"defaultType": "future"},  # Loads USDT-M Futures markets
+})
 TIMEFRAME = "4h"
+MIN_7D_AVG_VOLUME = 5_000_000  # $5 Million USD Daily Volume Threshold
 
 
 def get_all_futures_tokens():
   try:
     markets = exchange.load_markets()
-    pairs = [
+
+    # Step 1: Filter active USDT linear futures symbols
+    all_pairs = [
         symbol
         for symbol, market in markets.items()
-        if market.get("linear") and market.get("quote") == "USDT"
+        if market.get("swap")
+        and market.get("linear")
+        and market.get("quote") == "USDT"
+        and market.get("active", True)
     ]
-    if not pairs:
-      pairs = [s for s in markets.keys() if s.endswith("/USDT")]
-    return pairs
+
+    print(f"Loading 7-Day Volume for {len(all_pairs)} futures markets...")
+
+    filtered_pairs = []
+    for symbol in all_pairs:
+      try:
+        # Fetch last 8 daily candles (7 completed + 1 current active day)
+        ohlcv_1d = exchange.fetch_ohlcv(symbol, timeframe="1d", limit=8)
+        if len(ohlcv_1d) >= 8:
+          # Sum volume across 7 closed daily candles (index 1 to 7)
+          total_7d_vol = sum(candle[5] for candle in ohlcv_1d[1:8])
+          avg_daily_vol = total_7d_vol / 7.0
+
+          if avg_daily_vol >= MIN_7D_AVG_VOLUME:
+            filtered_pairs.append(symbol)
+
+        time.sleep(0.05)  # Safe rate-limit delay
+      except Exception as inner_e:
+        print(f"Volume check skipped for {symbol}: {inner_e}")
+        # Default keep liquid majors if fetch fails on specific symbol
+        if symbol in ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]:
+          filtered_pairs.append(symbol)
+
+    print(
+        f"Filtered Watchlist: {len(filtered_pairs)} tokens meet the > $5M 7-Day"
+        " Avg Daily Volume rule."
+    )
+
+    if filtered_pairs:
+      return filtered_pairs
+
+    return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
+
   except Exception as e:
     print(f"Error loading market list: {e}")
     return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
@@ -132,18 +183,18 @@ def run_full_scan():
       matched = check_liquidity_sweep(symbol)
       if matched:
         alerts_triggered += 1
-      time.sleep(0.15)  # Safe rate limit delay
+      time.sleep(0.12)  # Safe rate limit delay
     except Exception as e:
       print(f"Error in scanning loop for {symbol}: {e}")
       time.sleep(0.5)
 
   summary_msg = (
       f"🔍 *4H Scheduled Scan Complete*\n"
-      f"• *Tokens Checked:* `{len(watchlist)}`\n"
+      f"• *Tokens Filtered (> $5M 7d Vol):* `{len(watchlist)}`\n"
       f"• *Sweep Setups Found:* `{alerts_triggered}`"
   )
   send_telegram_alert(summary_msg)
-  print("Scan complete across all tokens!")
+  print(f"Scan complete across {len(watchlist)} quality tokens!")
 
 
 # =============================================================
@@ -181,7 +232,7 @@ def start_scheduler():
       # Seconds difference between current time and scheduled slot
       time_diff = (now_ist - target_dt).total_seconds()
 
-      # Only triggers between 0 and 180 seconds AFTER the slot time
+      # Triggers between 0 and 180 seconds AFTER the slot time
       if 0 <= time_diff <= 180:
         in_target_window = True
         if last_executed_slot != target:
