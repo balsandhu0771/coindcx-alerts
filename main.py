@@ -1,4 +1,5 @@
 import ccxt
+import threading
 import time
 import requests
 from datetime import datetime
@@ -145,34 +146,53 @@ def main():
     # Start web server on port 8080
     keep_alive()
 
-    send_telegram_alert(
-        "🤖 *IST Bot Live!* Server started with Webview enabled on 1:30 AM, 5:30 AM, 9:30 AM, 1:30 PM, 5:30 PM, and 9:30 PM IST schedule."
-    )
+   def start_scheduler():
+  def start_scheduler():
+  send_telegram_alert(
+      "IST Bot Live! Server started with Webview enabled on 1:30 AM, 5:30 AM,"
+      " 9:30 AM, 1:30 PM, 5:30 PM, and 9:30 PM IST schedule."
+  )
 
-    last_scanned_slot = None
+  last_executed_slot = None
 
-    while True:
-        now_ist = datetime.now(IST)
-        current_hour = now_ist.hour
-        current_minute = now_ist.minute
+  while True:
+    now_utc = datetime.now(timezone.utc)
+    current_time_ist = now_utc + timedelta(hours=5, minutes=30)
+    current_slot = current_time_ist.strftime("%H:%M")
 
-        is_target_time = False
-        slot_key = None
+    target_times = [
+        "01:30",
+        "05:30",
+        "09:30",
+        "13:30",
+        "17:30",
+        "21:30",
+    ]
 
-        for h, m in TARGET_IST_TIMES:
-            if current_hour == h and current_minute >= m and current_minute < m + 5:
-                slot_key = f"{h:02d}:{m:02d}"
-                if last_scanned_slot != slot_key:
-                    is_target_time = True
-                break
+    in_target_window = False
+    for target in target_times:
+      target_dt = datetime.strptime(target, "%H:%M")
+      slot_dt = datetime.strptime(current_slot, "%H:%M")
+      time_diff = abs((slot_dt - target_dt).total_seconds())
 
-        if is_target_time:
-            print(f"\nTriggering scheduled scan for IST slot: {slot_key}")
-            run_full_scan()
-            last_scanned_slot = slot_key
+      if time_diff <= 120:  # Within 2 minutes window
+        in_target_window = True
+        if last_executed_slot != target:
+          run_market_check()
+          last_executed_slot = target
+        break
 
-        time.sleep(30)
+    if not in_target_window:
+      last_executed_slot = None
+
+    time.sleep(30)
 
 
 if __name__ == "__main__":
-    main()
+  # 1. Start market scheduler in background thread
+  scheduler_thread = threading.Thread(target=start_scheduler, daemon=True)
+  scheduler_thread.start()
+
+  # 2. Start Flask Web Server for UptimeRobot health checks
+  port = int(os.environ.get("PORT", 8080))
+  app.run(host="0.0.0.0", port=port)
