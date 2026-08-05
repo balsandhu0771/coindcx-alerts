@@ -50,80 +50,78 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Volume Filter)
+# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Daily Volume Filter)
 # =============================================================
-exchange = ccxt.binance({
+# Using binanceusdm directly for native USD-M Futures support
+exchange = ccxt.binanceusdm({
     "enableRateLimit": True,
     "timeout": 30000,
-    "options": {"defaultType": "future"},  # USD-M Futures
 })
 TIMEFRAME = "4h"
-MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Volume Threshold
+MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Daily Volume Threshold
 
 
 def get_all_futures_tokens():
   try:
     markets = exchange.load_markets()
 
-    # Step 1: Extract unique active USDT linear futures symbols (e.g. 'BTCUSDT' -> 'BTC/USDT')
-    symbol_map = {}
-    for symbol, market in markets.items():
-      if (
-          market.get("swap")
-          and market.get("linear")
-          and market.get("quote") == "USDT"
-          and market.get("active", True)
-      ):
-        market_id = market.get("id")  # e.g., 'BTCUSDT'
-        if market_id and symbol_map.get(market_id) is None:
-          # Prefer clean 'BTC/USDT' over alias 'BTC/USDT:USDT'
-          if ":" not in symbol:
-            symbol_map[market_id] = symbol
+    # Get clean USDT futures symbols (e.g. BTC/USDT)
+    futures_symbols = [
+        symbol
+        for symbol, market in markets.items()
+        if market.get("quote") == "USDT"
+        and market.get("active", True)
+        and ":" not in symbol
+    ]
 
     print(
-        f"Loaded {len(symbol_map)} unique futures markets. Fetching 24h"
+        f"Loaded {len(futures_symbols)} active USDT futures pairs. Fetching 24h"
         " volume..."
     )
 
-    # Step 2: Query raw Binance Futures 24hr Ticker API directly (Fast & 100% reliable)
-    raw_tickers = exchange.fapiPublicGetTicker24hr()
+    # Fetch 24h ticker data using native CCXT method
+    tickers = exchange.fetch_tickers(futures_symbols)
+    filtered_list = []
 
-    filtered_pairs = []
-    for item in raw_tickers:
-      symbol_id = item.get("symbol")
-      if symbol_id in symbol_map:
-        quote_vol = float(item.get("quoteVolume", 0.0) or 0.0)
+    for symbol in futures_symbols:
+      ticker = tickers.get(symbol, {})
+      quote_vol = float(ticker.get("quoteVolume", 0.0) or 0.0)
 
-        # Enforce strict $5,000,000 USDT daily volume threshold
-        if quote_vol >= MIN_DAILY_VOLUME:
-          filtered_pairs.append(symbol_map[symbol_id])
+      # Dynamic backup volume check if quoteVolume is not populated
+      if quote_vol == 0.0:
+        base_vol = float(ticker.get("baseVolume", 0.0) or 0.0)
+        last_price = float(ticker.get("last", 0.0) or 0.0)
+        quote_vol = base_vol * last_price
+
+      if quote_vol >= MIN_DAILY_VOLUME:
+        filtered_list.append(symbol)
 
     print(
-        f"Watchlist ready: {len(filtered_pairs)} unique tokens met > $5M"
-        " volume filter."
+        f"Watchlist ready: {len(filtered_list)} unique tokens met > $5M volume"
+        " filter."
     )
 
-    # Fallback to all unique pairs if volume filter yields empty
-    if filtered_pairs:
-      return filtered_pairs
+    # If filtering returned results, return them; otherwise default to all active futures
+    if filtered_list:
+      return filtered_list
 
-    return list(symbol_map.values())
+    return futures_symbols
 
   except Exception as e:
     print(f"Error loading market volume tickers: {e}")
-    # Fail-safe backup: Return clean futures symbol list
-    try:
-      return [
-          symbol
-          for symbol, market in exchange.markets.items()
-          if market.get("swap")
-          and market.get("linear")
-          and market.get("quote") == "USDT"
-          and market.get("active", True)
-          and ":" not in symbol
-      ]
-    except Exception:
-      return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
+    # Fail-safe backup
+    return [
+        "BTC/USDT",
+        "ETH/USDT",
+        "SOL/USDT",
+        "XRP/USDT",
+        "ADA/USDT",
+        "DOGE/USDT",
+        "AVAX/USDT",
+        "NEAR/USDT",
+        "SUI/USDT",
+        "LINK/USDT",
+    ]
 
 
 # =============================================================
