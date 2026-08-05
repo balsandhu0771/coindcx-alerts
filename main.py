@@ -1,7 +1,7 @@
 import os
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 import ccxt
 from flask import Flask
@@ -25,15 +25,6 @@ TELEGRAM_BOT_TOKEN = "8642933768:AAH3afnXGmaAplHDar9u4uwJ5IZz0M7y7fs"
 TELEGRAM_CHAT_ID = "7203290966"
 IST = ZoneInfo("Asia/Kolkata")
 
-TARGET_IST_TIMES = [
-    (1, 30),  # 1:30 AM IST
-    (5, 30),  # 5:30 AM IST
-    (9, 30),  # 9:30 AM IST
-    (13, 30),  # 1:30 PM IST
-    (17, 30),  # 5:30 PM IST
-    (21, 30),  # 9:30 PM IST
-]
-
 
 def send_telegram_alert(message):
   url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -43,7 +34,7 @@ def send_telegram_alert(message):
       "parse_mode": "Markdown",
   }
   try:
-    requests.post(url, json=payload)
+    requests.post(url, json=payload, timeout=10)
   except Exception as e:
     print(f"Error sending Telegram alert: {e}")
 
@@ -147,9 +138,8 @@ def start_scheduler():
   last_executed_slot = None
 
   while True:
-    now_utc = datetime.now(timezone.utc)
-    current_time_ist = now_utc + timedelta(hours=5, minutes=30)
-    current_slot = current_time_ist.strftime("%H:%M")
+    now_ist = datetime.now(IST)
+    current_slot = now_ist.strftime("%H:%M")
 
     target_times = [
         "01:30",
@@ -162,11 +152,8 @@ def start_scheduler():
 
     in_target_window = False
     for target in target_times:
-      target_dt = datetime.strptime(target, "%H:%M")
-      slot_dt = datetime.strptime(current_slot, "%H:%M")
-      time_diff = abs((slot_dt - target_dt).total_seconds())
-
-      if time_diff <= 120:  # Within 2 minutes window
+      # Compare directly by hour and minute strings
+      if current_slot == target:
         in_target_window = True
         if last_executed_slot != target:
           run_full_scan()
@@ -176,7 +163,7 @@ def start_scheduler():
     if not in_target_window:
       last_executed_slot = None
 
-    time.sleep(30)
+    time.sleep(20)
 
 
 if __name__ == "__main__":
