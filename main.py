@@ -50,7 +50,7 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Volume Filter)
+# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Daily Volume Filter)
 # =============================================================
 exchange = ccxt.binance({
     "enableRateLimit": True,
@@ -65,53 +65,62 @@ def get_all_futures_tokens():
   try:
     markets = exchange.load_markets()
 
-    # Step 1: Extract all active USDT linear futures symbols
-    all_futures = [
-        symbol
-        for symbol, market in markets.items()
-        if market.get("swap")
-        and market.get("linear")
-        and market.get("quote") == "USDT"
-        and market.get("active", True)
-    ]
+    # Step 1: Extract map of raw Binance symbol IDs (e.g. "BTCUSDT") to CCXT symbols ("BTC/USDT")
+    symbol_map = {}
+    for symbol, market in markets.items():
+      if (
+          market.get("swap")
+          and market.get("linear")
+          and market.get("quote") == "USDT"
+          and market.get("active", True)
+      ):
+        market_id = market.get("id")  # e.g., 'BTCUSDT'
+        if market_id:
+          symbol_map[market_id] = symbol
 
     print(
-        f"Found {len(all_futures)} total futures pairs. Filtering for > $5M"
-        " 24h volume..."
+        f"Found {len(symbol_map)} active USDT futures markets. Fetching 24h"
+        " volume..."
     )
 
-    # Step 2: Safe volume filtering
+    # Step 2: Directly query Binance Futures 24hr Ticker API (1 fast request, no CCXT symbol bugs)
+    raw_tickers = exchange.fapiPublicGetTicker24hr()
+
     filtered_pairs = []
-    for symbol in all_futures:
-      try:
-        # Check volume via ticker structure
-        market = markets[symbol]
-        info = market.get("info", {})
+    for item in raw_tickers:
+      symbol_id = item.get("symbol")
+      if symbol_id in symbol_map:
+        # quoteVolume represents total 24h USDT traded volume
+        quote_vol = float(item.get("quoteVolume", 0.0) or 0.0)
 
-        # Binance 24h volume in USDT (quoteVolume / volume)
-        quote_vol = float(
-            info.get("quoteVolume") or info.get("volume") or 0.0
-        )
-
-        # Fallback to recent candle volume calculation if info volume is 0
         if quote_vol >= MIN_DAILY_VOLUME:
-          filtered_pairs.append(symbol)
-        elif quote_vol == 0:
-          # Keep symbol in list if volume metadata is temporarily missing
-          filtered_pairs.append(symbol)
-      except Exception:
-        # Never drop symbols if a single volume check fails
-        filtered_pairs.append(symbol)
+          filtered_pairs.append(symbol_map[symbol_id])
 
-    print(f"Watchlist ready: {len(filtered_pairs)} tokens selected.")
+    print(
+        f"Watchlist ready: {len(filtered_pairs)} futures tokens met the > $5M"
+        " 24h volume filter."
+    )
 
-    # Return filtered list, or all futures if filter resulted in 0
-    return filtered_pairs if filtered_pairs else all_futures
+    # Fail-safe: If volume filter yields list, return it; otherwise return all pairs
+    if filtered_pairs:
+      return filtered_pairs
+
+    return list(symbol_map.values())
 
   except Exception as e:
-    print(f"Error loading market list: {e}")
-    # Fail-safe: Return liquid pairs if exchange connection is completely down
-    return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
+    print(f"Error fetching volume tickers: {e}")
+    # Fail-safe: If direct API call fails, return all market symbols directly instead of dropping to 5
+    try:
+      return [
+          symbol
+          for symbol, market in exchange.markets.items()
+          if market.get("swap")
+          and market.get("linear")
+          and market.get("quote") == "USDT"
+          and market.get("active", True)
+      ]
+    except Exception:
+      return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
 
 
 # =============================================================
