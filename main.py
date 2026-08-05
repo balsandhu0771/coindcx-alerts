@@ -40,7 +40,7 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & WATCHLIST SETUP (Binance Data Feed)
+# 3. EXCHANGE & WATCHLIST SETUP (Binance Feed for 4H Candles)
 # =============================================================
 exchange = ccxt.binance({"enableRateLimit": True})
 TIMEFRAME = "4h"
@@ -129,16 +129,15 @@ def run_full_scan():
     matched = check_liquidity_sweep(symbol)
     if matched:
       alerts_triggered += 1
-    time.sleep(0.15)  # Pause to avoid Binance rate limits
+    time.sleep(0.15)  # Pause to avoid rate limits
 
-  # Summary message sent to Telegram on every scan completion
   summary_msg = (
-      f"🔍 *4H Scheduled Market Scan Complete*\n"
+      f"🔍 *4H Scheduled Scan Complete*\n"
       f"• *Tokens Checked:* `{len(watchlist)}`\n"
-      f"• *Sweep Setups Triggered:* `{alerts_triggered}`"
+      f"• *Sweep Alerts Found:* `{alerts_triggered}`"
   )
   send_telegram_alert(summary_msg)
-  print("Market scan complete across all tokens!")
+  print("Scan complete across all tokens!")
 
 
 # =============================================================
@@ -169,11 +168,7 @@ def start_scheduler():
 
     in_target_window = False
     for target in target_times:
-      target_dt = datetime.strptime(target, "%H:%M")
-      slot_dt = datetime.strptime(current_slot, "%H:%M")
-      time_diff = abs((slot_dt - target_dt).total_seconds())
-
-      if time_diff <= 120:  # Within 2-minute window
+      if current_slot == target:
         in_target_window = True
         if last_executed_slot != target:
           run_full_scan()
