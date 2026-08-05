@@ -142,12 +142,14 @@ def run_full_scan():
 # =============================================================
 def main():
     print("=== Starting Keep-Alive 24/7 IST 4H Sweep Indicator Bot ===")
+# ==============================================================================
+# 5. MAIN EXECUTION
+# ==============================================================================
 
-    # Start web server on port 8080
-    keep_alive()
 
-   def start_scheduler():
-  def start_scheduler():
+def start_scheduler():
+  print("=== Starting 24/7 CoinDCX Market Monitor ===")
+
   send_telegram_alert(
       "IST Bot Live! Server started with Webview enabled on 1:30 AM, 5:30 AM,"
       " 9:30 AM, 1:30 PM, 5:30 PM, and 9:30 PM IST schedule."
@@ -178,7 +180,7 @@ def main():
       if time_diff <= 120:  # Within 2 minutes window
         in_target_window = True
         if last_executed_slot != target:
-          run_market_check()
+          run_full_scan()
           last_executed_slot = target
         break
 
@@ -196,3 +198,4 @@ if __name__ == "__main__":
   # 2. Start Flask Web Server for UptimeRobot health checks
   port = int(os.environ.get("PORT", 8080))
   app.run(host="0.0.0.0", port=port)
+ 
