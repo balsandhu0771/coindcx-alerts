@@ -40,7 +40,7 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & WATCHLIST SETUP (Binance Feed)
+# 3. EXCHANGE & WATCHLIST SETUP (Binance Data Feed)
 # =============================================================
 exchange = ccxt.binance({"enableRateLimit": True})
 TIMEFRAME = "4h"
@@ -72,7 +72,7 @@ def check_liquidity_sweep(symbol):
     if not ohlcv or len(ohlcv) < 4:
       return False
 
-    # Candle -2 is the newly closed 4H candle; Candle -3 is the previous candle
+    # Index -2 is the newly closed 4H candle; Index -3 is the previous candle
     prev_high = ohlcv[-3][2]
     prev_low = ohlcv[-3][3]
 
@@ -161,7 +161,6 @@ def start_scheduler():
 
   while True:
     now_ist = datetime.now(IST)
-    current_time_str = now_ist.strftime("%H:%M")
 
     target_times = [
         "01:30",
@@ -175,11 +174,15 @@ def start_scheduler():
     in_target_window = False
     for target in target_times:
       target_hour, target_minute = map(int, target.split(":"))
-      # Check if current time is within 2 minutes of the target slot
-      if (
-          now_ist.hour == target_hour
-          and abs(now_ist.minute - target_minute) <= 2
-      ):
+      target_dt = now_ist.replace(
+          hour=target_hour, minute=target_minute, second=0, microsecond=0
+      )
+
+      # Seconds difference between current time and scheduled slot
+      time_diff = (now_ist - target_dt).total_seconds()
+
+      # Only triggers between 0 and 180 seconds AFTER the slot time
+      if 0 <= time_diff <= 180:
         in_target_window = True
         if last_executed_slot != target:
           run_full_scan()
