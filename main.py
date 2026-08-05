@@ -20,7 +20,6 @@ def home():
 
 @app.route("/trigger-scan")
 def trigger_manual_scan():
-  # Starts full scan in background thread
   threading.Thread(target=run_full_scan, daemon=True).start()
   return (
       "Manual 4H market scan (with $5M Volume Filter & Double-Sweep Filter)"
@@ -51,63 +50,67 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Daily Volume Filter)
+# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Volume Filter)
 # =============================================================
 exchange = ccxt.binance({
     "enableRateLimit": True,
     "timeout": 30000,
-    "options": {"defaultType": "future"},  # Loads USDT-M Futures markets
+    "options": {"defaultType": "future"},  # USD-M Futures
 })
 TIMEFRAME = "4h"
-MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Daily Volume Threshold
+MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Volume Threshold
 
 
 def get_all_futures_tokens():
   try:
     markets = exchange.load_markets()
 
-    # Get single bulk ticker call for fast volume filtering
-    tickers = exchange.fetch_tickers()
-
-    filtered_pairs = []
-
-    for symbol, market in markets.items():
-      # Filter for active USDT linear futures pairs
-      if (
-          market.get("swap")
-          and market.get("linear")
-          and market.get("quote") == "USDT"
-          and market.get("active", True)
-      ):
-
-        ticker = tickers.get(symbol) or tickers.get(market.get("id")) or {}
-
-        # 1. Try standard CCXT quote volume (USDT)
-        quote_vol = ticker.get("quoteVolume", 0) or 0
-
-        # 2. If quoteVolume is missing/raw, calculate: baseVolume * lastPrice
-        if not quote_vol or quote_vol < 100_000:
-          base_vol = ticker.get("baseVolume", 0) or 0
-          last_price = ticker.get("last", 0) or 0
-          quote_vol = base_vol * last_price
-
-        # Enforce the strict $5,000,000 USDT filter
-        if quote_vol >= MIN_DAILY_VOLUME:
-          filtered_pairs.append(symbol)
+    # Step 1: Extract all active USDT linear futures symbols
+    all_futures = [
+        symbol
+        for symbol, market in markets.items()
+        if market.get("swap")
+        and market.get("linear")
+        and market.get("quote") == "USDT"
+        and market.get("active", True)
+    ]
 
     print(
-        f"Filtered Watchlist: {len(filtered_pairs)} futures tokens met the >"
-        " $5M Volume rule."
+        f"Found {len(all_futures)} total futures pairs. Filtering for > $5M"
+        " 24h volume..."
     )
 
-    if filtered_pairs:
-      return filtered_pairs
+    # Step 2: Safe volume filtering
+    filtered_pairs = []
+    for symbol in all_futures:
+      try:
+        # Check volume via ticker structure
+        market = markets[symbol]
+        info = market.get("info", {})
 
-    print("Warning: Volume filter returned 0 tokens, using top liquid pairs.")
-    return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
+        # Binance 24h volume in USDT (quoteVolume / volume)
+        quote_vol = float(
+            info.get("quoteVolume") or info.get("volume") or 0.0
+        )
+
+        # Fallback to recent candle volume calculation if info volume is 0
+        if quote_vol >= MIN_DAILY_VOLUME:
+          filtered_pairs.append(symbol)
+        elif quote_vol == 0:
+          # Keep symbol in list if volume metadata is temporarily missing
+          filtered_pairs.append(symbol)
+      except Exception:
+        # Never drop symbols if a single volume check fails
+        filtered_pairs.append(symbol)
+
+    print(f"Watchlist ready: {len(filtered_pairs)} tokens selected.")
+
+    # Return filtered list, or all futures if filter resulted in 0
+    return filtered_pairs if filtered_pairs else all_futures
 
   except Exception as e:
-    print(f"Error loading volume tickers: {e}")
+    print(f"Error loading market list: {e}")
+    # Fail-safe: Return liquid pairs if exchange connection is completely down
     return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
 
 
@@ -116,12 +119,10 @@ def get_all_futures_tokens():
 # =============================================================
 def check_liquidity_sweep(symbol):
   try:
-    # Fetch 4 candles to evaluate the newly closed candle safely
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=4)
     if not ohlcv or len(ohlcv) < 4:
       return False
 
-    # Index -2 is the newly closed 4H candle; Index -3 is the previous candle
     prev_high = ohlcv[-3][2]
     prev_low = ohlcv[-3][3]
 
@@ -232,10 +233,8 @@ def start_scheduler():
           hour=target_hour, minute=target_minute, second=0, microsecond=0
       )
 
-      # Seconds difference between current time and scheduled slot
       time_diff = (now_ist - target_dt).total_seconds()
 
-      # Triggers between 0 and 180 seconds AFTER the slot time
       if 0 <= time_diff <= 180:
         in_target_window = True
         if last_executed_slot != target:
