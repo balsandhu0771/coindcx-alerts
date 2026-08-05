@@ -23,8 +23,8 @@ def trigger_manual_scan():
   # Starts full scan in background thread
   threading.Thread(target=run_full_scan, daemon=True).start()
   return (
-      "Manual 4H market scan (with 7-Day $5M Volume Filter) started! Check"
-      " Telegram in 2 minutes.",
+      "Manual 4H market scan (with $5M Volume Filter) started! Check Telegram"
+      " in 2 minutes.",
       200,
   )
 
@@ -51,7 +51,7 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & WATCHLIST SETUP (7-Day $5M Daily Volume Filter)
+# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Volume Filter)
 # =============================================================
 exchange = ccxt.binance({
     "enableRateLimit": True,
@@ -59,48 +59,36 @@ exchange = ccxt.binance({
     "options": {"defaultType": "future"},  # Loads USDT-M Futures markets
 })
 TIMEFRAME = "4h"
-MIN_7D_AVG_VOLUME = 5_000_000  # $5 Million USD Daily Volume Threshold
+MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Volume Threshold
 
 
 def get_all_futures_tokens():
   try:
     markets = exchange.load_markets()
 
-    # Step 1: Filter active USDT linear futures symbols
-    all_pairs = [
-        symbol
-        for symbol, market in markets.items()
-        if market.get("swap")
-        and market.get("linear")
-        and market.get("quote") == "USDT"
-        and market.get("active", True)
-    ]
-
-    print(f"Loading 7-Day Volume for {len(all_pairs)} futures markets...")
+    # Step 1: Get single bulk ticker response for volume filtering in 1 call
+    tickers = exchange.fetch_tickers()
 
     filtered_pairs = []
-    for symbol in all_pairs:
-      try:
-        # Fetch last 8 daily candles (7 completed + 1 current active day)
-        ohlcv_1d = exchange.fetch_ohlcv(symbol, timeframe="1d", limit=8)
-        if len(ohlcv_1d) >= 8:
-          # Sum volume across 7 closed daily candles (index 1 to 7)
-          total_7d_vol = sum(candle[5] for candle in ohlcv_1d[1:8])
-          avg_daily_vol = total_7d_vol / 7.0
+    for symbol, market in markets.items():
+      # Check if active USDT linear futures market
+      if (
+          market.get("swap")
+          and market.get("linear")
+          and market.get("quote") == "USDT"
+          and market.get("active", True)
+      ):
 
-          if avg_daily_vol >= MIN_7D_AVG_VOLUME:
-            filtered_pairs.append(symbol)
+        ticker = tickers.get(symbol, {})
+        # Extracts 24-hour USDT quote volume
+        quote_vol = ticker.get("quoteVolume", 0) or 0
 
-        time.sleep(0.05)  # Safe rate-limit delay
-      except Exception as inner_e:
-        print(f"Volume check skipped for {symbol}: {inner_e}")
-        # Default keep liquid majors if fetch fails on specific symbol
-        if symbol in ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT"]:
+        if quote_vol >= MIN_DAILY_VOLUME:
           filtered_pairs.append(symbol)
 
     print(
-        f"Filtered Watchlist: {len(filtered_pairs)} tokens meet the > $5M 7-Day"
-        " Avg Daily Volume rule."
+        f"Filtered Watchlist: {len(filtered_pairs)} futures tokens meet > $5M"
+        " Volume rule."
     )
 
     if filtered_pairs:
@@ -109,7 +97,7 @@ def get_all_futures_tokens():
     return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
 
   except Exception as e:
-    print(f"Error loading market list: {e}")
+    print(f"Error loading market list or volume tickers: {e}")
     return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
 
 
@@ -190,7 +178,7 @@ def run_full_scan():
 
   summary_msg = (
       f"🔍 *4H Scheduled Scan Complete*\n"
-      f"• *Tokens Filtered (> $5M 7d Vol):* `{len(watchlist)}`\n"
+      f"• *Tokens Filtered (> $5M Vol):* `{len(watchlist)}`\n"
       f"• *Sweep Setups Found:* `{alerts_triggered}`"
   )
   send_telegram_alert(summary_msg)
