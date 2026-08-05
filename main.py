@@ -61,100 +61,85 @@ MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Daily Volume Threshold
 
 
 def get_all_futures_tokens():
+  # Direct REST API fetch to bypass CCXT market loading rate-limits
+  url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+  headers = {
+      "User-Agent": (
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      )
+  }
+
   try:
-    # Always force reload of market structure
-    markets = exchange.load_markets(True)
+    response = requests.get(url, headers=headers, timeout=15)
+    if response.status_code == 200:
+      data = response.json()
+      filtered_tokens = []
 
-    # Step 1: Filter active USDT futures trading pairs (exclude alias pairs containing ':')
-    futures_symbols = [
-        symbol
-        for symbol, market in markets.items()
-        if market.get("quote") == "USDT"
-        and market.get("active", True)
-        and ":" not in symbol
-    ]
+      for item in data:
+        symbol = item.get("symbol", "")
 
-    print(
-        f"Loaded {len(futures_symbols)} active USDT futures pairs from"
-        " exchange."
-    )
+        # Target active USDT perpetual futures (e.g. BTCUSDT, ETHUSDT)
+        # Exclude quarterly futures with numbers (e.g. BTCUSDT_240927)
+        if symbol.endswith("USDT") and "_" not in symbol:
+          quote_vol = float(item.get("quoteVolume", 0.0) or 0.0)
 
-    if not futures_symbols:
-      # Secondary extraction fallback if active flag filtering was too strict
-      futures_symbols = [
-          symbol
-          for symbol, market in markets.items()
-          if market.get("quote") == "USDT" and ":" not in symbol
-      ]
-
-    # Step 2: Safe Volume Filtering via direct API request
-    filtered_list = []
-    try:
-      raw_tickers = exchange.public_get_ticker_24hr()
-      # Build quick lookup dictionary for 24h quote volume (USDT)
-      vol_lookup = {
-          item["symbol"]: float(item.get("quoteVolume", 0.0) or 0.0)
-          for item in raw_tickers
-          if "symbol" in item
-      }
-
-      for symbol in futures_symbols:
-        market_id = markets[symbol].get("id")
-        vol = vol_lookup.get(market_id, 0.0)
-
-        if vol >= MIN_DAILY_VOLUME or vol == 0.0:
-          filtered_list.append(symbol)
+          if quote_vol >= MIN_DAILY_VOLUME:
+            # Format cleanly for CCXT OHLCV calls (BTCUSDT -> BTC/USDT)
+            base_coin = symbol[:-4]
+            ccxt_symbol = f"{base_coin}/USDT"
+            filtered_tokens.append(ccxt_symbol)
 
       print(
-          f"Watchlist ready: {len(filtered_list)} unique tokens met volume"
-          " threshold."
+          f"Watchlist ready: {len(filtered_tokens)} unique tokens met > $5M"
+          " volume filter."
       )
 
-      if filtered_list:
-        return filtered_list
-
-    except Exception as vol_err:
-      print(
-          f"Volume filtering error ({vol_err}), defaulting to full futures"
-          " market list."
-      )
-
-    return futures_symbols
+      if filtered_tokens:
+        return filtered_tokens
 
   except Exception as e:
-    print(f"Error loading market list: {e}")
-    # Fail-safe backup: fetch live ticker symbols directly via HTTP fallback
-    try:
-      raw_tickers = requests.get(
-          "https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10
-      ).json()
-      fallback_pairs = []
-      for item in raw_tickers:
-        sym = item.get("symbol", "")
-        quote_vol = float(item.get("quoteVolume", 0.0) or 0.0)
-        if sym.endswith("USDT") and quote_vol >= MIN_DAILY_VOLUME:
-          # Convert 'BTCUSDT' to CCXT format 'BTC/USDT'
-          base = sym[:-4]
-          fallback_pairs.append(f"{base}/USDT")
+    print(f"Direct API fetch error: {e}")
 
-      if fallback_pairs:
-        return fallback_pairs
-    except Exception as fallback_err:
-      print(f"HTTP fallback error: {fallback_err}")
-
-    # Final guaranteed list if all network calls fail
-    return [
-        "BTC/USDT",
-        "ETH/USDT",
-        "SOL/USDT",
-        "XRP/USDT",
-        "ADA/USDT",
-        "DOGE/USDT",
-        "AVAX/USDT",
-        "NEAR/USDT",
-        "SUI/USDT",
-        "LINK/USDT",
+  # Backup Fetch: Exchange Info Endpoint
+  try:
+    info_url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    resp = requests.get(info_url, headers=headers, timeout=15).json()
+    backup_tokens = [
+        f"{s['baseAsset']}/USDT"
+        for s in resp.get("symbols", [])
+        if s.get("quoteAsset") == "USDT"
+        and s.get("status") == "TRADING"
+        and "_" not in s.get("symbol", "")
     ]
+    if backup_tokens:
+      print(f"Backup Watchlist ready: {len(backup_tokens)} tokens.")
+      return backup_tokens
+  except Exception as backup_err:
+    print(f"Backup endpoint error: {backup_err}")
+
+  # Final fail-safe top liquid market list
+  return [
+      "BTC/USDT",
+      "ETH/USDT",
+      "SOL/USDT",
+      "XRP/USDT",
+      "ADA/USDT",
+      "DOGE/USDT",
+      "AVAX/USDT",
+      "NEAR/USDT",
+      "SUI/USDT",
+      "LINK/USDT",
+      "DOT/USDT",
+      "MATIC/USDT",
+      "BCH/USDT",
+      "LTC/USDT",
+      "APT/USDT",
+      "PEPE/USDT",
+      "SHIB/USDT",
+      "FET/USDT",
+      "ARBR/USDT",
+      "OP/USDT",
+  ]
 
 
 # =============================================================
