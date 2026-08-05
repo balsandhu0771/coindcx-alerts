@@ -40,25 +40,22 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & DYNAMIC WATCHLIST SETUP
+# 3. EXCHANGE & DYNAMIC WATCHLIST SETUP (CoinDCX)
 # =============================================================
-exchange = ccxt.binance()
+exchange = ccxt.coindcx({"enableRateLimit": True})
 TIMEFRAME = "4h"
 
 
 def get_all_futures_tokens():
   try:
     markets = exchange.load_markets()
-    futures_pairs = [
-        symbol
-        for symbol, market in markets.items()
-        if market.get("linear") and market.get("quote") == "USDT"
-    ]
-    if not futures_pairs:
-      futures_pairs = [s for s in markets.keys() if s.endswith("/USDT")]
-    return futures_pairs
+    # Filter for USDT trading pairs on CoinDCX
+    pairs = [s for s in markets.keys() if s.endswith("/USDT")]
+    if not pairs:
+      pairs = list(markets.keys())
+    return pairs
   except Exception as e:
-    print(f"Error loading markets dynamically: {e}")
+    print(f"Error loading CoinDCX markets: {e}")
     return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
 
 
@@ -69,7 +66,7 @@ def check_liquidity_sweep(symbol):
   try:
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=3)
     if not ohlcv or len(ohlcv) < 3:
-      return
+      return False
 
     prev_high = ohlcv[-2][2]
     prev_low = ohlcv[-2][3]
@@ -82,6 +79,7 @@ def check_liquidity_sweep(symbol):
     if curr_high > prev_high and curr_close < prev_high:
       msg = (
           f"🚨 *BEARISH SWEEP ALERT (SHORT)* 🚨\n\n"
+          f"*Exchange:* `CoinDCX`\n"
           f"*Token:* `{symbol}`\n"
           f"*Timeframe:* 4-Hour (IST Schedule)\n"
           f"*Current Close:* `${curr_close}`\n"
@@ -91,6 +89,7 @@ def check_liquidity_sweep(symbol):
       )
       print(f"[MATCH SHORT] {symbol}")
       send_telegram_alert(msg)
+      return True
 
     # 2. BULLISH SWEEP (LONG) WITH PREV HIGH CAP
     elif (
@@ -100,6 +99,7 @@ def check_liquidity_sweep(symbol):
     ):
       msg = (
           f"🚨 *BULLISH SWEEP ALERT (LONG)* 🚨\n\n"
+          f"*Exchange:* `CoinDCX`\n"
           f"*Token:* `{symbol}`\n"
           f"*Timeframe:* 4-Hour (IST Schedule)\n"
           f"*Current Close:* `${curr_close}`\n"
@@ -110,18 +110,34 @@ def check_liquidity_sweep(symbol):
       )
       print(f"[MATCH LONG] {symbol}")
       send_telegram_alert(msg)
+      return True
+
+    return False
 
   except Exception as e:
-    print(f"Error checking {symbol}: {e}")
+    print(f"Error checking {symbol} on CoinDCX: {e}")
+    return False
 
 
 def run_full_scan():
   watchlist = get_all_futures_tokens()
-  print(f"\n--- Starting Full Scan across {len(watchlist)} tokens ---")
+  print(f"\n--- Starting CoinDCX Scan across {len(watchlist)} tokens ---")
+
+  alerts_triggered = 0
   for symbol in watchlist:
-    check_liquidity_sweep(symbol)
-    time.sleep(0.15)
-  print("Scan complete across all tokens!")
+    matched = check_liquidity_sweep(symbol)
+    if matched:
+      alerts_triggered += 1
+    time.sleep(0.25)  # Pause to respect CoinDCX rate limits
+
+  # Summary message sent to Telegram
+  summary_msg = (
+      f"🔍 *CoinDCX Scheduled Scan Complete*\n"
+      f"• *Tokens Checked:* `{len(watchlist)}`\n"
+      f"• *Sweep Alerts Found:* `{alerts_triggered}`"
+  )
+  send_telegram_alert(summary_msg)
+  print("CoinDCX scan complete!")
 
 
 # =============================================================
@@ -152,8 +168,11 @@ def start_scheduler():
 
     in_target_window = False
     for target in target_times:
-      # Compare directly by hour and minute strings
-      if current_slot == target:
+      target_dt = datetime.strptime(target, "%H:%M")
+      slot_dt = datetime.strptime(current_slot, "%H:%M")
+      time_diff = abs((slot_dt - target_dt).total_seconds())
+
+      if time_diff <= 120:  # Within 2-minute window
         in_target_window = True
         if last_executed_slot != target:
           run_full_scan()
