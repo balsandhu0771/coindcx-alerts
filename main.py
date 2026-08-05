@@ -50,7 +50,7 @@ def send_telegram_alert(message):
 
 
 # =============================================================
-# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Daily Volume Filter & Deduplicated)
+# 3. EXCHANGE & WATCHLIST SETUP ($5M+ Volume Filter)
 # =============================================================
 exchange = ccxt.binance({
     "enableRateLimit": True,
@@ -58,57 +58,72 @@ exchange = ccxt.binance({
     "options": {"defaultType": "future"},  # USD-M Futures
 })
 TIMEFRAME = "4h"
-MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Daily Volume Threshold
+MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Volume Threshold
 
 
 def get_all_futures_tokens():
   try:
     markets = exchange.load_markets()
 
-    # Step 1: Extract standard, unique active USDT linear futures pairs (no ':' aliases)
-    futures_symbols = [
-        symbol
-        for symbol, market in markets.items()
-        if market.get("swap")
-        and market.get("linear")
-        and market.get("quote") == "USDT"
-        and market.get("active", True)
-        and ":" not in symbol
-    ]
-
-    print(f"Found {len(futures_symbols)} unique active USDT futures markets.")
-
-    # Step 2: Query 24h tickers via CCXT
-    tickers = exchange.fetch_tickers()
-    filtered_list = []
-
-    for symbol in futures_symbols:
-      ticker = tickers.get(symbol) or {}
-
-      # Calculate volume accurately
-      quote_vol = ticker.get("quoteVolume") or 0.0
-      if not quote_vol or quote_vol < 1000:
-        base_vol = ticker.get("baseVolume") or 0.0
-        last_price = ticker.get("last") or 0.0
-        quote_vol = base_vol * last_price
-
-      if quote_vol >= MIN_DAILY_VOLUME:
-        filtered_list.append(symbol)
+    # Step 1: Extract unique active USDT linear futures symbols (e.g. 'BTCUSDT' -> 'BTC/USDT')
+    symbol_map = {}
+    for symbol, market in markets.items():
+      if (
+          market.get("swap")
+          and market.get("linear")
+          and market.get("quote") == "USDT"
+          and market.get("active", True)
+      ):
+        market_id = market.get("id")  # e.g., 'BTCUSDT'
+        if market_id and symbol_map.get(market_id) is None:
+          # Prefer clean 'BTC/USDT' over alias 'BTC/USDT:USDT'
+          if ":" not in symbol:
+            symbol_map[market_id] = symbol
 
     print(
-        f"Watchlist ready: {len(filtered_list)} unique tokens met > $5M volume"
-        " filter."
+        f"Loaded {len(symbol_map)} unique futures markets. Fetching 24h"
+        " volume..."
     )
 
-    if filtered_list:
-      return filtered_list
+    # Step 2: Query raw Binance Futures 24hr Ticker API directly (Fast & 100% reliable)
+    raw_tickers = exchange.fapiPublicGetTicker24hr()
 
-    return futures_symbols
+    filtered_pairs = []
+    for item in raw_tickers:
+      symbol_id = item.get("symbol")
+      if symbol_id in symbol_map:
+        quote_vol = float(item.get("quoteVolume", 0.0) or 0.0)
+
+        # Enforce strict $5,000,000 USDT daily volume threshold
+        if quote_vol >= MIN_DAILY_VOLUME:
+          filtered_pairs.append(symbol_map[symbol_id])
+
+    print(
+        f"Watchlist ready: {len(filtered_pairs)} unique tokens met > $5M"
+        " volume filter."
+    )
+
+    # Fallback to all unique pairs if volume filter yields empty
+    if filtered_pairs:
+      return filtered_pairs
+
+    return list(symbol_map.values())
 
   except Exception as e:
-    print(f"Error loading market list: {e}")
-    # Fail-safe backup
-    return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
+    print(f"Error loading market volume tickers: {e}")
+    # Fail-safe backup: Return clean futures symbol list
+    try:
+      return [
+          symbol
+          for symbol, market in exchange.markets.items()
+          if market.get("swap")
+          and market.get("linear")
+          and market.get("quote") == "USDT"
+          and market.get("active", True)
+          and ":" not in symbol
+      ]
+    except Exception:
+      return ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT"]
 
 
 # =============================================================
