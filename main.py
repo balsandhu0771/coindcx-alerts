@@ -57,7 +57,6 @@ exchange = ccxt.binanceusdm({
 })
 MIN_DAILY_VOLUME = 5_000_000  # $5 Million USD Volume Threshold
 
-# Active watchlist tracking dictionary for 15m background monitor
 active_watchlists = {}
 watchlist_lock = threading.Lock()
 
@@ -144,32 +143,65 @@ def get_all_futures_tokens():
 
 
 # =============================================================
-# 4. 15-MINUTE LEVEL EXTRACTION & MSS LOGIC
+# 4. STRICT 15M SWING LEVEL & MSS EXTRACTION
 # =============================================================
-def extract_15m_levels(symbol, direction):
-  """Unpacks recent 4H sweep candle into 15m candles to find peaks and 15m MSS levels."""
+def extract_15m_levels(symbol, direction, target_4h_candle):
+  """Extracts 15m swing levels mapped specifically to the -2 4H candle time window.
+
+  - Isolates the exact 16 fifteen-minute candles of the -2 4H candle.
+  - Finds H_max or L_min peak candle.
+  - Locates the immediate preceding 3-candle pivot low/high (Swing Level).
+  """
   try:
-    ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
-    if not ohlcv_15m or len(ohlcv_15m) < 8:
+    c_open_time = target_4h_candle[0]
+    c_close_time = c_open_time + (4 * 60 * 60 * 1000)  # +4 hours in ms
+
+    # Fetch 30 fifteen-minute candles to cover the entire 4H candle window + buffer
+    ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=30)
+    if not ohlcv_15m:
       return None
 
-    candles_window = ohlcv_15m[:-1]  # Exclude current forming candle
+    # Filter 15m candles that belong strictly to the target 4H sweep candle
+    sweep_15m_candles = [
+        c for c in ohlcv_15m if c_open_time <= c[0] < c_close_time
+    ]
+
+    # If timestamp alignment returned fewer than 12 candles, fallback to the last 16 completed 15m candles
+    if len(sweep_15m_candles) < 12:
+      sweep_15m_candles = ohlcv_15m[-17:-1]
+
+    latest_close = ohlcv_15m[-2][4]  # Close of last completed 15m candle
 
     if direction == 'SHORT':
+      # 1. Find the 15m candle with the Highest High (H_max)
       max_high = -1.0
       peak_idx = 0
-      for i, candle in enumerate(candles_window):
+      for i, candle in enumerate(sweep_15m_candles):
         if candle[2] > max_high:
           max_high = candle[2]
           peak_idx = i
 
-      if peak_idx > 0:
-        pre_peak_candles = candles_window[max(0, peak_idx - 6) : peak_idx]
-        l_mss = min(c[3] for c in pre_peak_candles)
-      else:
-        l_mss = candles_window[0][3]
+      # 2. Find the 15m Swing Low immediately BEFORE the peak (Pivot Search)
+      l_mss = None
 
-      latest_close = candles_window[-1][4]
+      # Search backwards from peak_idx - 1 for a 3-candle pivot low
+      for i in range(peak_idx - 1, 0, -1):
+        if i < len(sweep_15m_candles) - 1:
+          curr_low = sweep_15m_candles[i][3]
+          left_low = sweep_15m_candles[i - 1][3]
+          right_low = sweep_15m_candles[i + 1][3]
+
+          if curr_low < left_low and curr_low < right_low:
+            l_mss = curr_low
+            break
+
+      # Fallback: If no pivot low found before peak, take the minimum low before peak
+      if l_mss is None:
+        if peak_idx > 0:
+          l_mss = min(c[3] for c in sweep_15m_candles[:peak_idx])
+        else:
+          l_mss = sweep_15m_candles[0][3]
+
       already_mss = latest_close < l_mss
 
       return {
@@ -180,22 +212,35 @@ def extract_15m_levels(symbol, direction):
       }
 
     elif direction == 'LONG':
+      # 1. Find the 15m candle with the Lowest Low (L_min)
       min_low = float('inf')
       trough_idx = 0
-      for i, candle in enumerate(candles_window):
+      for i, candle in enumerate(sweep_15m_candles):
         if candle[3] < min_low:
           min_low = candle[3]
           trough_idx = i
 
-      if trough_idx > 0:
-        pre_trough_candles = candles_window[
-            max(0, trough_idx - 6) : trough_idx
-        ]
-        h_mss = max(c[2] for c in pre_trough_candles)
-      else:
-        h_mss = candles_window[0][2]
+      # 2. Find the 15m Swing High immediately BEFORE the trough (Pivot Search)
+      h_mss = None
 
-      latest_close = candles_window[-1][4]
+      # Search backwards from trough_idx - 1 for a 3-candle pivot high
+      for i in range(trough_idx - 1, 0, -1):
+        if i < len(sweep_15m_candles) - 1:
+          curr_high = sweep_15m_candles[i][2]
+          left_high = sweep_15m_candles[i - 1][2]
+          right_high = sweep_15m_candles[i + 1][2]
+
+          if curr_high > left_high and curr_high > right_high:
+            h_mss = curr_high
+            break
+
+      # Fallback: If no pivot high found before trough, take maximum high before trough
+      if h_mss is None:
+        if trough_idx > 0:
+          h_mss = max(c[2] for c in sweep_15m_candles[:trough_idx])
+        else:
+          h_mss = sweep_15m_candles[0][2]
+
       already_mss = latest_close > h_mss
 
       return {
@@ -222,9 +267,10 @@ def check_liquidity_sweep(symbol):
     prev_high = ohlcv_4h[-3][2]
     prev_low = ohlcv_4h[-3][3]
 
-    closed_high = ohlcv_4h[-2][2]
-    closed_low = ohlcv_4h[-2][3]
-    closed_close = ohlcv_4h[-2][4]
+    sweep_candle_4h = ohlcv_4h[-2]  # The -2 4H candle
+    closed_high = sweep_candle_4h[2]
+    closed_low = sweep_candle_4h[3]
+    closed_close = sweep_candle_4h[4]
 
     # Filter: Double Sweeps Ignore
     if (closed_high > prev_high) and (closed_low < prev_low):
@@ -232,17 +278,15 @@ def check_liquidity_sweep(symbol):
 
     # 1. BEARISH SWEEP (SHORT) SETUP
     if closed_high > prev_high and closed_close < prev_high:
-      levels = extract_15m_levels(symbol, 'SHORT')
+      levels = extract_15m_levels(symbol, 'SHORT', sweep_candle_4h)
       if not levels:
         return False
 
-      # Calculate R:R
       risk = levels['h_max'] - levels['l_mss']
       reward = levels['l_mss'] - prev_low
       rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
 
       if levels['already_mss']:
-        # Case A: MSS already confirmed during -2 candle -> Fire immediately
         msg = (
             f'🚨 *BEARISH 4H SWEEP + 15M MSS (SHORT)* 🚨\n\n'
             f'*Token:* `{symbol}`\n'
@@ -259,7 +303,6 @@ def check_liquidity_sweep(symbol):
         send_telegram_alert(msg)
         return True
       else:
-        # Case B: MSS pending -> Add to active watchlist for 15m background tracking
         with watchlist_lock:
           active_watchlists[symbol] = {
               'direction': 'SHORT',
@@ -280,17 +323,15 @@ def check_liquidity_sweep(symbol):
         and (closed_close > prev_low)
         and (closed_close < prev_high)
     ):
-      levels = extract_15m_levels(symbol, 'LONG')
+      levels = extract_15m_levels(symbol, 'LONG', sweep_candle_4h)
       if not levels:
         return False
 
-      # Calculate R:R
       risk = levels['h_mss'] - levels['l_min']
       reward = prev_high - levels['h_mss']
       rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
 
       if levels['already_mss']:
-        # Case A: MSS already confirmed during -2 candle -> Fire immediately
         msg = (
             f'🚨 *BULLISH 4H SWEEP + 15M MSS (LONG)* 🚨\n\n'
             f'*Token:* `{symbol}`\n'
@@ -307,7 +348,6 @@ def check_liquidity_sweep(symbol):
         send_telegram_alert(msg)
         return True
       else:
-        # Case B: MSS pending -> Add to active watchlist for 15m background tracking
         with watchlist_lock:
           active_watchlists[symbol] = {
               'direction': 'LONG',
@@ -333,7 +373,6 @@ def check_liquidity_sweep(symbol):
 # 6. 15-MINUTE BACKGROUND WATCHLIST MONITOR
 # =============================================================
 def check_15m_watchlists():
-  """Runs every 15 minutes to evaluate active pending setups for MSS or Invalidation."""
   with watchlist_lock:
     if not active_watchlists:
       return
@@ -465,8 +504,8 @@ def run_full_scan():
 def start_scheduler():
   print('=== Starting 24/7 Market Monitor ===')
   send_telegram_alert(
-      'IST Bot Live! Scanning 4H Sweeps with 15m MSS Tracking & R:R Ratio'
-      ' Calculations.'
+      'IST Bot Live! Scanning 4H Sweeps with Strict 15m Pivot Swing'
+      ' Detection & R:R Calculations.'
   )
 
   last_executed_slot = None
