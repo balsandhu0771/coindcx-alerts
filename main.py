@@ -143,74 +143,67 @@ def get_all_futures_tokens():
 
 
 # =============================================================
-# 4. MACRO STRUCTURAL 15M LEVEL EXTRACTION
+# 4. CLOSEST 15M PIVOT EXTRACTION WITH STRICT -3 BOUNDARY
 # =============================================================
 def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
-  """Extracts the true structural 15m swing low/high of the expansion leg leading to the peak/trough."""
+  """Extracts the CLOSEST 15m 3-candle pivot prior to the sweep peak/trough.
+
+  Covering both -3 and -2 4H windows (~32 fifteen-minute candles). Enforces the
+  strict -3 4H boundary rule.
+  """
   try:
     c_open_time = target_4h_candle[0]
     c_close_time = c_open_time + (4 * 60 * 60 * 1000)
 
-    # Fetch 36 fifteen-minute candles (~9 hours of data)
-    ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe="15m", limit=36)
-    if not ohlcv_15m:
+    # Fetch 40 fifteen-minute candles to fully cover -3 4H + -2 4H candles (32 candles + buffer)
+    ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe="15m", limit=40)
+    if not ohlcv_15m or len(ohlcv_15m) < 16:
       return None
 
-    # Buffer 8 candles prior to 4H open to capture full origin leg
-    pre_buffer_time = c_open_time - (8 * 15 * 60 * 1000)
-    extended_15m_candles = [
-        c for c in ohlcv_15m if pre_buffer_time <= c[0] < c_close_time
+    # Cover from start of -3 4H candle (-4 hrs before -2 open) up to close of -2 4H candle
+    start_window_time = c_open_time - (4 * 60 * 60 * 1000)
+    sweep_15m_candles = [
+        c for c in ohlcv_15m if start_window_time <= c[0] < c_close_time
     ]
 
-    if len(extended_15m_candles) < 12:
-      extended_15m_candles = ohlcv_15m[-24:-1]
+    if len(sweep_15m_candles) < 16:
+      sweep_15m_candles = ohlcv_15m[-33:-1]
 
-    latest_close = ohlcv_15m[-2][4]
+    latest_close = ohlcv_15m[-2][4]  # Close of last completed 15m candle
 
     if direction == "SHORT":
-      # 1. Absolute Peak (H_max)
-      sweep_only_candles = [
-          c for c in extended_15m_candles if c[0] >= c_open_time
-      ]
-      if not sweep_only_candles:
-        sweep_only_candles = extended_15m_candles
-
-      max_high = max(c[2] for c in sweep_only_candles)
-
+      # 1. Identify Highest High (H_max) formed during the sweep
+      max_high = -1.0
       peak_idx = 0
-      for i, candle in enumerate(extended_15m_candles):
-        if candle[2] == max_high:
+      for i, candle in enumerate(sweep_15m_candles):
+        if candle[2] > max_high:
+          max_high = candle[2]
           peak_idx = i
-          break
 
-      # 2. Extract MACRO Structural Swing Low (L_mss)
-      # Find all valid 3-candle pivot lows before peak_idx
-      pivot_lows = []
-      for i in range(1, peak_idx):
-        if i < len(extended_15m_candles) - 1:
-          curr_low = extended_15m_candles[i][3]
-          left_low = extended_15m_candles[i - 1][3]
-          right_low = extended_15m_candles[i + 1][3]
+      # 2. Search BACKWARDS starting from peak_idx - 1 for the CLOSEST 3-candle pivot low
+      l_mss = None
+      for i in range(peak_idx - 1, 0, -1):
+        if i < len(sweep_15m_candles) - 1:
+          curr_low = sweep_15m_candles[i][3]
+          left_low = sweep_15m_candles[i - 1][3]
+          right_low = sweep_15m_candles[i + 1][3]
 
-          if curr_low <= left_low and curr_low <= right_low:
-            pivot_lows.append((i, curr_low))
+          # Strict 3-candle pivot low
+          if curr_low < left_low and curr_low < right_low:
+            l_mss = curr_low
+            break  # Found the CLOSEST pivot low immediately before peak!
 
-      if pivot_lows:
-        # Pick the lowest pivot low that sits below top 25% zone of the move
-        overall_leg_min = min(c[3] for c in extended_15m_candles[:peak_idx])
-        valid_pivots = [
-            p[1]
-            for p in pivot_lows
-            if p[1] < (max_high - 0.25 * (max_high - overall_leg_min))
-        ]
-        l_mss = min(valid_pivots) if valid_pivots else pivot_lows[-1][1]
-      else:
-        l_mss = min(c[3] for c in extended_15m_candles[:peak_idx])
+      # Fallback: Minimum low before peak if no 3-candle pivot formed
+      if l_mss is None:
+        if peak_idx > 0:
+          l_mss = min(c[3] for c in sweep_15m_candles[:peak_idx])
+        else:
+          l_mss = sweep_15m_candles[0][3]
 
-      # Boundary Filter: L_mss MUST be LOWER than -3 4H High
+      # BOUNDARY RULE: Closest 15m swing low MUST be strictly lower than -3 4H High
       if l_mss >= prev_4h_level:
         print(
-            f"[SKIP SHORT] {symbol} 15m swing low ({l_mss}) >= -3 4H High"
+            f"[SKIP SHORT] {symbol} closest 15m low ({l_mss}) >= -3 4H High"
             f" ({prev_4h_level})."
         )
         return None
@@ -225,47 +218,38 @@ def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
       }
 
     elif direction == "LONG":
-      # 1. Absolute Trough (L_min)
-      sweep_only_candles = [
-          c for c in extended_15m_candles if c[0] >= c_open_time
-      ]
-      if not sweep_only_candles:
-        sweep_only_candles = extended_15m_candles
-
-      min_low = min(c[3] for c in sweep_only_candles)
-
+      # 1. Identify Lowest Low (L_min) formed during the sweep
+      min_low = float("inf")
       trough_idx = 0
-      for i, candle in enumerate(extended_15m_candles):
-        if candle[3] == min_low:
+      for i, candle in enumerate(sweep_15m_candles):
+        if candle[3] < min_low:
+          min_low = candle[3]
           trough_idx = i
-          break
 
-      # 2. Extract MACRO Structural Swing High (H_mss)
-      pivot_highs = []
-      for i in range(1, trough_idx):
-        if i < len(extended_15m_candles) - 1:
-          curr_high = extended_15m_candles[i][2]
-          left_high = extended_15m_candles[i - 1][2]
-          right_high = extended_15m_candles[i + 1][2]
+      # 2. Search BACKWARDS starting from trough_idx - 1 for the CLOSEST 3-candle pivot high
+      h_mss = None
+      for i in range(trough_idx - 1, 0, -1):
+        if i < len(sweep_15m_candles) - 1:
+          curr_high = sweep_15m_candles[i][2]
+          left_high = sweep_15m_candles[i - 1][2]
+          right_high = sweep_15m_candles[i + 1][2]
 
-          if curr_high >= left_high and curr_high >= right_high:
-            pivot_highs.append((i, curr_high))
+          # Strict 3-candle pivot high
+          if curr_high > left_high and curr_high > right_high:
+            h_mss = curr_high
+            break  # Found the CLOSEST pivot high immediately before trough!
 
-      if pivot_highs:
-        overall_leg_max = max(c[2] for c in extended_15m_candles[:trough_idx])
-        valid_pivots = [
-            p[1]
-            for p in pivot_highs
-            if p[1] > (min_low + 0.25 * (overall_leg_max - min_low))
-        ]
-        h_mss = max(valid_pivots) if valid_pivots else pivot_highs[-1][1]
-      else:
-        h_mss = max(c[2] for c in extended_15m_candles[:trough_idx])
+      # Fallback: Maximum high before trough if no 3-candle pivot formed
+      if h_mss is None:
+        if trough_idx > 0:
+          h_mss = max(c[2] for c in sweep_15m_candles[:trough_idx])
+        else:
+          h_mss = sweep_15m_candles[0][2]
 
-      # Boundary Filter: H_mss MUST be HIGHER than -3 4H Low
+      # BOUNDARY RULE: Closest 15m swing high MUST be strictly higher than -3 4H Low
       if h_mss <= prev_4h_level:
         print(
-            f"[SKIP LONG] {symbol} 15m swing high ({h_mss}) <= -3 4H Low"
+            f"[SKIP LONG] {symbol} closest 15m high ({h_mss}) <= -3 4H Low"
             f" ({prev_4h_level})."
         )
         return None
@@ -293,15 +277,15 @@ def check_liquidity_sweep(symbol):
     if not ohlcv_4h or len(ohlcv_4h) < 4:
       return False
 
-    prev_high = ohlcv_4h[-3][2]
-    prev_low = ohlcv_4h[-3][3]
+    prev_high = ohlcv_4h[-3][2]  # -3 4H High
+    prev_low = ohlcv_4h[-3][3]  # -3 4H Low
 
-    sweep_candle_4h = ohlcv_4h[-2]
+    sweep_candle_4h = ohlcv_4h[-2]  # The -2 4H candle
     closed_high = sweep_candle_4h[2]
     closed_low = sweep_candle_4h[3]
     closed_close = sweep_candle_4h[4]
 
-    # Filter: Ignore Double Sweeps
+    # Filter: Double Sweeps Ignore
     if (closed_high > prev_high) and (closed_low < prev_low):
       return False
 
@@ -339,252 +323,4 @@ def check_liquidity_sweep(symbol):
               "direction": "SHORT",
               "h_max": levels["h_max"],
               "l_mss": levels["l_mss"],
-              "prev_low": prev_low,
-              "expires_at": datetime.now(IST) + timedelta(hours=4),
-          }
-        print(
-            f"[ADDED TO WATCHLIST SHORT] {symbol} | H_max: {levels['h_max']} |"
-            f" L_mss: {levels['l_mss']} | R:R: 1:{rr_ratio}"
-        )
-        return False
-
-    # 2. BULLISH SWEEP (LONG) SETUP
-    elif (
-        (closed_low < prev_low)
-        and (closed_close > prev_low)
-        and (closed_close < prev_high)
-    ):
-      levels = extract_15m_levels(
-          symbol, "LONG", sweep_candle_4h, prev_4h_level=prev_low
-      )
-      if not levels:
-        return False
-
-      risk = levels["h_mss"] - levels["l_min"]
-      reward = prev_high - levels["h_mss"]
-      rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
-
-      if levels["already_mss"]:
-        msg = (
-            f"🚨 *BULLISH 4H SWEEP + 15M MSS (LONG)* 🚨\n\n"
-            f"*Token:* `{symbol}`\n"
-            f"*Current Price:* `${levels['latest_close']}`\n"
-            f"*15m Swing High (Entry):* `${levels['h_mss']}`\n"
-            f"*Stop Loss (L_min):* `${levels['l_min']}` (Prev Low:"
-            f" `${prev_low}`)\n"
-            f"*Take Profit (Prev High):* `${prev_high}`\n"
-            f"*Est. Risk-to-Reward (R:R):* `1:{rr_ratio}`\n\n"
-            f"💡 *Setup:* 4H low swept and 15m structure already shifted"
-            f" bullish!"
-        )
-        print(f"[MATCH LONG IMMEDIATE] {symbol}")
-        send_telegram_alert(msg)
-        return True
-      else:
-        with watchlist_lock:
-          active_watchlists[symbol] = {
-              "direction": "LONG",
-              "l_min": levels["l_min"],
-              "h_mss": levels["h_mss"],
-              "prev_high": prev_high,
-              "expires_at": datetime.now(IST) + timedelta(hours=4),
-          }
-        print(
-            f"[ADDED TO WATCHLIST LONG] {symbol} | L_min: {levels['l_min']} |"
-            f" H_mss: {levels['h_mss']} | R:R: 1:{rr_ratio}"
-        )
-        return False
-
-    return False
-
-  except Exception as e:
-    print(f"Error checking {symbol}: {e}")
-    return False
-
-
-# =============================================================
-# 6. 15-MINUTE BACKGROUND WATCHLIST MONITOR
-# =============================================================
-def check_15m_watchlists():
-  with watchlist_lock:
-    if not active_watchlists:
-      return
-    symbols_to_check = list(active_watchlists.items())
-
-  print(
-      f"\n--- [15m Monitor] Checking {len(symbols_to_check)} pending setups"
-      " ---"
-  )
-  now_time = datetime.now(IST)
-  symbols_to_remove = []
-
-  for symbol, data in symbols_to_check:
-    try:
-      if now_time > data["expires_at"]:
-        print(f"[EXPIRED] {symbol} setup expired after 4 hours.")
-        symbols_to_remove.append(symbol)
-        continue
-
-      ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe="15m", limit=3)
-      if not ohlcv_15m or len(ohlcv_15m) < 2:
-        continue
-
-      latest_high = ohlcv_15m[-1][2]
-      latest_low = ohlcv_15m[-1][3]
-      latest_close = ohlcv_15m[-2][4]
-
-      # BEARISH WATCHLIST CHECK
-      if data["direction"] == "SHORT":
-        if latest_high > data["h_max"]:
-          print(
-              f"[INVALIDATED SHORT] {symbol} broke above H_max"
-              f" ({data['h_max']})."
-          )
-          symbols_to_remove.append(symbol)
-          continue
-
-        if latest_close < data["l_mss"]:
-          risk = data["h_max"] - data["l_mss"]
-          reward = data["l_mss"] - data["prev_low"]
-          rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
-
-          msg = (
-              f"🚨 *BEARISH 4H SWEEP + 15M MSS CONFIRMED* 🚨\n\n"
-              f"*Token:* `{symbol}`\n"
-              f"*Current 15m Close:* `${latest_close}`\n"
-              f"*15m Swing Low (Entry):* `${data['l_mss']}`\n"
-              f"*Stop Loss (H_max):* `${data['h_max']}`\n"
-              f"*Take Profit (Prev Low):* `${data['prev_low']}`\n"
-              f"*Est. Risk-to-Reward (R:R):* `1:{rr_ratio}`\n\n"
-              f"💡 *Setup:* Price held below 4H peak and just confirmed 15m"
-              f" MSS!"
-          )
-          print(f"[TRIGGER SHORT 15M] {symbol}")
-          send_telegram_alert(msg)
-          symbols_to_remove.append(symbol)
-          continue
-
-      # BULLISH WATCHLIST CHECK
-      elif data["direction"] == "LONG":
-        if latest_low < data["l_min"]:
-          print(
-              f"[INVALIDATED LONG] {symbol} broke below L_min"
-              f" ({data['l_min']})."
-          )
-          symbols_to_remove.append(symbol)
-          continue
-
-        if latest_close > data["h_mss"]:
-          risk = data["h_mss"] - data["l_min"]
-          reward = data["prev_high"] - data["h_mss"]
-          rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
-
-          msg = (
-              f"🚨 *BULLISH 4H SWEEP + 15M MSS CONFIRMED* 🚨\n\n"
-              f"*Token:* `{symbol}`\n"
-              f"*Current 15m Close:* `${latest_close}`\n"
-              f"*15m Swing High (Entry):* `${data['h_mss']}`\n"
-              f"*Stop Loss (L_min):* `${data['l_min']}`\n"
-              f"*Take Profit (Prev High):* `${data['prev_high']}`\n"
-              f"*Est. Risk-to-Reward (R:R):* `1:{rr_ratio}`\n\n"
-              f"💡 *Setup:* Price held above 4H trough and just confirmed 15m"
-              f" MSS!"
-          )
-          print(f"[TRIGGER LONG 15M] {symbol}")
-          send_telegram_alert(msg)
-          symbols_to_remove.append(symbol)
-          continue
-
-    except Exception as e:
-      print(f"Error monitoring watchlist for {symbol}: {e}")
-
-  with watchlist_lock:
-    for sym in symbols_to_remove:
-      active_watchlists.pop(sym, None)
-
-
-def run_full_scan():
-  watchlist = get_all_futures_tokens()
-  print(f"\n--- Starting Full Scan across {len(watchlist)} tokens ---")
-
-  immediate_alerts = 0
-  for symbol in watchlist:
-    try:
-      matched = check_liquidity_sweep(symbol)
-      if matched:
-        immediate_alerts += 1
-      time.sleep(0.12)
-    except Exception as e:
-      print(f"Error in scanning loop for {symbol}: {e}")
-      time.sleep(0.5)
-
-  with watchlist_lock:
-    pending_count = len(active_watchlists)
-
-  summary_msg = (
-      f"🔍 *4H Sweep + 15M MSS Scan Complete*\n"
-      f"• *Tokens Scanned:* `{len(watchlist)}`\n"
-      f"• *Immediate MSS Alerts Fired:* `{immediate_alerts}`\n"
-      f"• *Added to Active 15m Watchlist:* `{pending_count}`"
-  )
-  send_telegram_alert(summary_msg)
-  print(f"Scan complete across {len(watchlist)} quality tokens!")
-
-
-# =============================================================
-# 7. SCHEDULER & MAIN EXECUTION
-# =============================================================
-def start_scheduler():
-  print("=== Starting 24/7 Market Monitor ===")
-  send_telegram_alert(
-      "IST Bot Live! Scanning 4H Sweeps with Macro Structural Leg Pivots &"
-      " Threshold Depth Filters."
-  )
-
-  last_executed_slot = None
-  last_15m_min = -1
-
-  while True:
-    now_ist = datetime.now(IST)
-
-    target_times = [
-        "01:30",
-        "05:30",
-        "09:30",
-        "13:30",
-        "17:30",
-        "21:30",
-    ]
-    in_target_window = False
-    for target in target_times:
-      target_hour, target_minute = map(int, target.split(":"))
-      target_dt = now_ist.replace(
-          hour=target_hour, minute=target_minute, second=0, microsecond=0
-      )
-
-      time_diff = (now_ist - target_dt).total_seconds()
-
-      if 0 <= time_diff <= 180:
-        in_target_window = True
-        if last_executed_slot != target:
-          run_full_scan()
-          last_executed_slot = target
-        break
-
-    if not in_target_window:
-      last_executed_slot = None
-
-    curr_min = now_ist.minute
-    if curr_min in [1, 16, 31, 46] and curr_min != last_15m_min:
-      threading.Thread(target=check_15m_watchlists, daemon=True).start()
-      last_15m_min = curr_min
-
-    time.sleep(15)
-
-
-if __name__ == "__main__":
-  scheduler_thread = threading.Thread(target=start_scheduler, daemon=True)
-  scheduler_thread.start()
-
-  port = int(os.environ.get("PORT", 8080))
-  app.run(host="0.0.0.0", port=port)
+              "prev_low": prev
