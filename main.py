@@ -143,71 +143,75 @@ def get_all_futures_tokens():
 
 
 # =============================================================
-# 4. STRUCTURAL 15M LEVEL EXTRACTION WITH -3 BOUNDARY FILTER
+# 4. MACRO STRUCTURAL 15M LEVEL EXTRACTION
 # =============================================================
 def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
-  """Extracts structural 15m swing levels mapped to the -2 4H candle time window.
-
-  - BULLISH: Finds L_min (trough) and the TRUE structural swing high (H_mss)
-  at the top of the leg leading down into L_min. Ensures H_mss > prev_4h_low
-  (-3 low).
-  - BEARISH: Finds H_max (peak) and the TRUE structural swing low (L_mss) at
-  the bottom of the leg leading up into H_max. Ensures L_mss < prev_4h_high (-3
-  high).
-  """
+  """Extracts the true structural 15m swing low/high of the expansion leg leading to the peak/trough."""
   try:
     c_open_time = target_4h_candle[0]
-    c_close_time = c_open_time + (4 * 60 * 60 * 1000)  # +4 hours in ms
+    c_close_time = c_open_time + (4 * 60 * 60 * 1000)
 
-    ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe="15m", limit=30)
+    # Fetch 36 fifteen-minute candles (~9 hours of data)
+    ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe="15m", limit=36)
     if not ohlcv_15m:
       return None
 
-    # Filter 15m candles strictly within the -2 4H candle window
-    sweep_15m_candles = [
-        c for c in ohlcv_15m if c_open_time <= c[0] < c_close_time
+    # Buffer 8 candles prior to 4H open to capture full origin leg
+    pre_buffer_time = c_open_time - (8 * 15 * 60 * 1000)
+    extended_15m_candles = [
+        c for c in ohlcv_15m if pre_buffer_time <= c[0] < c_close_time
     ]
 
-    if len(sweep_15m_candles) < 12:
-      sweep_15m_candles = ohlcv_15m[-17:-1]
+    if len(extended_15m_candles) < 12:
+      extended_15m_candles = ohlcv_15m[-24:-1]
 
-    latest_close = ohlcv_15m[-2][4]  # Close of last completed 15m candle
+    latest_close = ohlcv_15m[-2][4]
 
     if direction == "SHORT":
-      # 1. Locate absolute Peak (H_max)
-      max_high = -1.0
+      # 1. Absolute Peak (H_max)
+      sweep_only_candles = [
+          c for c in extended_15m_candles if c[0] >= c_open_time
+      ]
+      if not sweep_only_candles:
+        sweep_only_candles = extended_15m_candles
+
+      max_high = max(c[2] for c in sweep_only_candles)
+
       peak_idx = 0
-      for i, candle in enumerate(sweep_15m_candles):
-        if candle[2] > max_high:
-          max_high = candle[2]
+      for i, candle in enumerate(extended_15m_candles):
+        if candle[2] == max_high:
           peak_idx = i
+          break
 
-      # 2. Extract TRUE Structural Swing Low (L_mss) before the peak
-      l_mss = None
+      # 2. Extract MACRO Structural Swing Low (L_mss)
+      # Find all valid 3-candle pivot lows before peak_idx
+      pivot_lows = []
+      for i in range(1, peak_idx):
+        if i < len(extended_15m_candles) - 1:
+          curr_low = extended_15m_candles[i][3]
+          left_low = extended_15m_candles[i - 1][3]
+          right_low = extended_15m_candles[i + 1][3]
 
-      # Search backwards from peak_idx - 1 for a 3-candle pivot low
-      for i in range(peak_idx - 1, 0, -1):
-        if i < len(sweep_15m_candles) - 1:
-          curr_low = sweep_15m_candles[i][3]
-          left_low = sweep_15m_candles[i - 1][3]
-          right_low = sweep_15m_candles[i + 1][3]
+          if curr_low <= left_low and curr_low <= right_low:
+            pivot_lows.append((i, curr_low))
 
-          if curr_low < left_low and curr_low < right_low:
-            l_mss = curr_low
-            break
+      if pivot_lows:
+        # Pick the lowest pivot low that sits below top 25% zone of the move
+        overall_leg_min = min(c[3] for c in extended_15m_candles[:peak_idx])
+        valid_pivots = [
+            p[1]
+            for p in pivot_lows
+            if p[1] < (max_high - 0.25 * (max_high - overall_leg_min))
+        ]
+        l_mss = min(valid_pivots) if valid_pivots else pivot_lows[-1][1]
+      else:
+        l_mss = min(c[3] for c in extended_15m_candles[:peak_idx])
 
-      # Fallback: Minimum low of the leg prior to peak (excluding peak candle)
-      if l_mss is None:
-        if peak_idx > 0:
-          l_mss = min(c[3] for c in sweep_15m_candles[:peak_idx])
-        else:
-          l_mss = sweep_15m_candles[0][3]
-
-      # BOUNDARY RULE: L_mss MUST be LOWER than the -3 4H High
+      # Boundary Filter: L_mss MUST be LOWER than -3 4H High
       if l_mss >= prev_4h_level:
         print(
-            f"[SKIP SHORT] {symbol} 15m swing low ({l_mss}) is NOT lower than"
-            f" -3 4H High ({prev_4h_level})."
+            f"[SKIP SHORT] {symbol} 15m swing low ({l_mss}) >= -3 4H High"
+            f" ({prev_4h_level})."
         )
         return None
 
@@ -221,40 +225,48 @@ def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
       }
 
     elif direction == "LONG":
-      # 1. Locate absolute Trough (L_min)
-      min_low = float("inf")
+      # 1. Absolute Trough (L_min)
+      sweep_only_candles = [
+          c for c in extended_15m_candles if c[0] >= c_open_time
+      ]
+      if not sweep_only_candles:
+        sweep_only_candles = extended_15m_candles
+
+      min_low = min(c[3] for c in sweep_only_candles)
+
       trough_idx = 0
-      for i, candle in enumerate(sweep_15m_candles):
-        if candle[3] < min_low:
-          min_low = candle[3]
+      for i, candle in enumerate(extended_15m_candles):
+        if candle[3] == min_low:
           trough_idx = i
+          break
 
-      # 2. Extract TRUE Structural Swing High (H_mss) before the trough
-      h_mss = None
+      # 2. Extract MACRO Structural Swing High (H_mss)
+      pivot_highs = []
+      for i in range(1, trough_idx):
+        if i < len(extended_15m_candles) - 1:
+          curr_high = extended_15m_candles[i][2]
+          left_high = extended_15m_candles[i - 1][2]
+          right_high = extended_15m_candles[i + 1][2]
 
-      # Search backwards from trough_idx - 1 for a 3-candle pivot high at the top of the leg
-      for i in range(trough_idx - 1, 0, -1):
-        if i < len(sweep_15m_candles) - 1:
-          curr_high = sweep_15m_candles[i][2]
-          left_high = sweep_15m_candles[i - 1][2]
-          right_high = sweep_15m_candles[i + 1][2]
+          if curr_high >= left_high and curr_high >= right_high:
+            pivot_highs.append((i, curr_high))
 
-          if curr_high > left_high and curr_high > right_high:
-            h_mss = curr_high
-            break
+      if pivot_highs:
+        overall_leg_max = max(c[2] for c in extended_15m_candles[:trough_idx])
+        valid_pivots = [
+            p[1]
+            for p in pivot_highs
+            if p[1] > (min_low + 0.25 * (overall_leg_max - min_low))
+        ]
+        h_mss = max(valid_pivots) if valid_pivots else pivot_highs[-1][1]
+      else:
+        h_mss = max(c[2] for c in extended_15m_candles[:trough_idx])
 
-      # Fallback: Maximum high of the leg prior to trough (excluding trough candle)
-      if h_mss is None:
-        if trough_idx > 0:
-          h_mss = max(c[2] for c in sweep_15m_candles[:trough_idx])
-        else:
-          h_mss = sweep_15m_candles[0][2]
-
-      # BOUNDARY RULE: H_mss MUST be HIGHER than the -3 4H Low
+      # Boundary Filter: H_mss MUST be HIGHER than -3 4H Low
       if h_mss <= prev_4h_level:
         print(
-            f"[SKIP LONG] {symbol} 15m swing high ({h_mss}) is NOT higher than"
-            f" -3 4H Low ({prev_4h_level})."
+            f"[SKIP LONG] {symbol} 15m swing high ({h_mss}) <= -3 4H Low"
+            f" ({prev_4h_level})."
         )
         return None
 
@@ -281,15 +293,15 @@ def check_liquidity_sweep(symbol):
     if not ohlcv_4h or len(ohlcv_4h) < 4:
       return False
 
-    prev_high = ohlcv_4h[-3][2]  # -3 4H High
-    prev_low = ohlcv_4h[-3][3]  # -3 4H Low
+    prev_high = ohlcv_4h[-3][2]
+    prev_low = ohlcv_4h[-3][3]
 
-    sweep_candle_4h = ohlcv_4h[-2]  # The -2 4H candle
+    sweep_candle_4h = ohlcv_4h[-2]
     closed_high = sweep_candle_4h[2]
     closed_low = sweep_candle_4h[3]
     closed_close = sweep_candle_4h[4]
 
-    # Filter: Double Sweeps Ignore
+    # Filter: Ignore Double Sweeps
     if (closed_high > prev_high) and (closed_low < prev_low):
       return False
 
@@ -525,8 +537,8 @@ def run_full_scan():
 def start_scheduler():
   print("=== Starting 24/7 Market Monitor ===")
   send_telegram_alert(
-      "IST Bot Live! Scanning 4H Sweeps with Mapped 15m Structural Leg Pivots"
-      " & -3 Boundary Filters."
+      "IST Bot Live! Scanning 4H Sweeps with Macro Structural Leg Pivots &"
+      " Threshold Depth Filters."
   )
 
   last_executed_slot = None
