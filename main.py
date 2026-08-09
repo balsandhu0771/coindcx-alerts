@@ -323,4 +323,252 @@ def check_liquidity_sweep(symbol):
               "direction": "SHORT",
               "h_max": levels["h_max"],
               "l_mss": levels["l_mss"],
-              "prev_low": prev
+              "prev_low": prev_low,
+              "expires_at": datetime.now(IST) + timedelta(hours=4),
+          }
+        print(
+            f"[ADDED TO WATCHLIST SHORT] {symbol} | H_max: {levels['h_max']} |"
+            f" L_mss: {levels['l_mss']} | R:R: 1:{rr_ratio}"
+        )
+        return False
+
+    # 2. BULLISH SWEEP (LONG) SETUP
+    elif (
+        (closed_low < prev_low)
+        and (closed_close > prev_low)
+        and (closed_close < prev_high)
+    ):
+      levels = extract_15m_levels(
+          symbol, "LONG", sweep_candle_4h, prev_4h_level=prev_low
+      )
+      if not levels:
+        return False
+
+      risk = levels["h_mss"] - levels["l_min"]
+      reward = prev_high - levels["h_mss"]
+      rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
+
+      if levels["already_mss"]:
+        msg = (
+            f"🚨 *BULLISH 4H SWEEP + 15M MSS (LONG)* 🚨\n\n"
+            f"*Token:* `{symbol}`\n"
+            f"*Current Price:* `${levels['latest_close']}`\n"
+            f"*15m Swing High (Entry):* `${levels['h_mss']}`\n"
+            f"*Stop Loss (L_min):* `${levels['l_min']}` (Prev Low:"
+            f" `${prev_low}`)\n"
+            f"*Take Profit (Prev High):* `${prev_high}`\n"
+            f"*Est. Risk-to-Reward (R:R):* `1:{rr_ratio}`\n\n"
+            f"💡 *Setup:* 4H low swept and 15m structure already shifted"
+            f" bullish!"
+        )
+        print(f"[MATCH LONG IMMEDIATE] {symbol}")
+        send_telegram_alert(msg)
+        return True
+      else:
+        with watchlist_lock:
+          active_watchlists[symbol] = {
+              "direction": "LONG",
+              "l_min": levels["l_min"],
+              "h_mss": levels["h_mss"],
+              "prev_high": prev_high,
+              "expires_at": datetime.now(IST) + timedelta(hours=4),
+          }
+        print(
+            f"[ADDED TO WATCHLIST LONG] {symbol} | L_min: {levels['l_min']} |"
+            f" H_mss: {levels['h_mss']} | R:R: 1:{rr_ratio}"
+        )
+        return False
+
+    return False
+
+  except Exception as e:
+    print(f"Error checking {symbol}: {e}")
+    return False
+
+
+# =============================================================
+# 6. 15-MINUTE BACKGROUND WATCHLIST MONITOR
+# =============================================================
+def check_15m_watchlists():
+  with watchlist_lock:
+    if not active_watchlists:
+      return
+    symbols_to_check = list(active_watchlists.items())
+
+  print(
+      f"\n--- [15m Monitor] Checking {len(symbols_to_check)} pending setups"
+      " ---"
+  )
+  now_time = datetime.now(IST)
+  symbols_to_remove = []
+
+  for symbol, data in symbols_to_check:
+    try:
+      if now_time > data["expires_at"]:
+        print(f"[EXPIRED] {symbol} setup expired after 4 hours.")
+        symbols_to_remove.append(symbol)
+        continue
+
+      ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe="15m", limit=3)
+      if not ohlcv_15m or len(ohlcv_15m) < 2:
+        continue
+
+      latest_high = ohlcv_15m[-1][2]
+      latest_low = ohlcv_15m[-1][3]
+      latest_close = ohlcv_15m[-2][4]
+
+      # BEARISH WATCHLIST CHECK
+      if data["direction"] == "SHORT":
+        if latest_high > data["h_max"]:
+          print(
+              f"[INVALIDATED SHORT] {symbol} broke above H_max"
+              f" ({data['h_max']})."
+          )
+          symbols_to_remove.append(symbol)
+          continue
+
+        if latest_close < data["l_mss"]:
+          risk = data["h_max"] - data["l_mss"]
+          reward = data["l_mss"] - data["prev_low"]
+          rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
+
+          msg = (
+              f"🚨 *BEARISH 4H SWEEP + 15M MSS CONFIRMED* 🚨\n\n"
+              f"*Token:* `{symbol}`\n"
+              f"*Current 15m Close:* `${latest_close}`\n"
+              f"*15m Swing Low (Entry):* `${data['l_mss']}`\n"
+              f"*Stop Loss (H_max):* `${data['h_max']}`\n"
+              f"*Take Profit (Prev Low):* `${data['prev_low']}`\n"
+              f"*Est. Risk-to-Reward (R:R):* `1:{rr_ratio}`\n\n"
+              f"💡 *Setup:* Price held below 4H peak and just confirmed 15m"
+              f" MSS!"
+          )
+          print(f"[TRIGGER SHORT 15M] {symbol}")
+          send_telegram_alert(msg)
+          symbols_to_remove.append(symbol)
+          continue
+
+      # BULLISH WATCHLIST CHECK
+      elif data["direction"] == "LONG":
+        if latest_low < data["l_min"]:
+          print(
+              f"[INVALIDATED LONG] {symbol} broke below L_min"
+              f" ({data['l_min']})."
+          )
+          symbols_to_remove.append(symbol)
+          continue
+
+        if latest_close > data["h_mss"]:
+          risk = data["h_mss"] - data["l_min"]
+          reward = data["prev_high"] - data["h_mss"]
+          rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
+
+          msg = (
+              f"🚨 *BULLISH 4H SWEEP + 15M MSS CONFIRMED* 🚨\n\n"
+              f"*Token:* `{symbol}`\n"
+              f"*Current 15m Close:* `${latest_close}`\n"
+              f"*15m Swing High (Entry):* `${data['h_mss']}`\n"
+              f"*Stop Loss (L_min):* `${data['l_min']}`\n"
+              f"*Take Profit (Prev High):* `${data['prev_high']}`\n"
+              f"*Est. Risk-to-Reward (R:R):* `1:{rr_ratio}`\n\n"
+              f"💡 *Setup:* Price held above 4H trough and just confirmed 15m"
+              f" MSS!"
+          )
+          print(f"[TRIGGER LONG 15M] {symbol}")
+          send_telegram_alert(msg)
+          symbols_to_remove.append(symbol)
+          continue
+
+    except Exception as e:
+      print(f"Error monitoring watchlist for {symbol}: {e}")
+
+  with watchlist_lock:
+    for sym in symbols_to_remove:
+      active_watchlists.pop(sym, None)
+
+
+def run_full_scan():
+  watchlist = get_all_futures_tokens()
+  print(f"\n--- Starting Full Scan across {len(watchlist)} tokens ---")
+
+  immediate_alerts = 0
+  for symbol in watchlist:
+    try:
+      matched = check_liquidity_sweep(symbol)
+      if matched:
+        immediate_alerts += 1
+      time.sleep(0.12)
+    except Exception as e:
+      print(f"Error in scanning loop for {symbol}: {e}")
+      time.sleep(0.5)
+
+  with watchlist_lock:
+    pending_count = len(active_watchlists)
+
+  summary_msg = (
+      f"🔍 *4H Sweep + 15M MSS Scan Complete*\n"
+      f"• *Tokens Scanned:* `{len(watchlist)}`\n"
+      f"• *Immediate MSS Alerts Fired:* `{immediate_alerts}`\n"
+      f"• *Added to Active 15m Watchlist:* `{pending_count}`"
+  )
+  send_telegram_alert(summary_msg)
+  print(f"Scan complete across {len(watchlist)} quality tokens!")
+
+
+# =============================================================
+# 7. SCHEDULER & MAIN EXECUTION
+# =============================================================
+def start_scheduler():
+  print("=== Starting 24/7 Market Monitor ===")
+  send_telegram_alert(
+      "IST Bot Live! Scanning 4H Sweeps with Closest 15m Pivots (-3 Window"
+      " Extended) & Strict Boundary Filters."
+  )
+
+  last_executed_slot = None
+  last_15m_min = -1
+
+  while True:
+    now_ist = datetime.now(IST)
+
+    target_times = [
+        "01:30",
+        "05:30",
+        "09:30",
+        "13:30",
+        "17:30",
+        "21:30",
+    ]
+    in_target_window = False
+    for target in target_times:
+      target_hour, target_minute = map(int, target.split(":"))
+      target_dt = now_ist.replace(
+          hour=target_hour, minute=target_minute, second=0, microsecond=0
+      )
+
+      time_diff = (now_ist - target_dt).total_seconds()
+
+      if 0 <= time_diff <= 180:
+        in_target_window = True
+        if last_executed_slot != target:
+          run_full_scan()
+          last_executed_slot = target
+        break
+
+    if not in_target_window:
+      last_executed_slot = None
+
+    curr_min = now_ist.minute
+    if curr_min in [1, 16, 31, 46] and curr_min != last_15m_min:
+      threading.Thread(target=check_15m_watchlists, daemon=True).start()
+      last_15m_min = curr_min
+
+    time.sleep(15)
+
+
+if __name__ == "__main__":
+  scheduler_thread = threading.Thread(target=start_scheduler, daemon=True)
+  scheduler_thread.start()
+
+  port = int(os.environ.get("PORT", 8080))
+  app.run(host="0.0.0.0", port=port)
