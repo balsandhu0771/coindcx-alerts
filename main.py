@@ -143,24 +143,22 @@ def get_all_futures_tokens():
 
 
 # =============================================================
-# 4. CLOSEST 15M PIVOT EXTRACTION WITH STRICT -3 BOUNDARY
+# 4. CLOSEST 15M PIVOT EXTRACTION WITH FULL-WINDOW MSS CHECK
 # =============================================================
 def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
   """Extracts the CLOSEST 15m 3-candle pivot prior to the sweep peak/trough.
 
-  Covering both -3 and -2 4H windows (~32 fifteen-minute candles). Enforces the
-  strict -3 4H boundary rule.
+  Covering both -3 and -2 4H windows (~32 fifteen-minute candles). Enforces
+  strict -3 boundary rule and checks ALL post-peak candles for MSS.
   """
   try:
     c_open_time = target_4h_candle[0]
     c_close_time = c_open_time + (4 * 60 * 60 * 1000)
 
-    # Fetch 40 fifteen-minute candles to fully cover -3 4H + -2 4H candles (32 candles + buffer)
     ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe="15m", limit=40)
     if not ohlcv_15m or len(ohlcv_15m) < 16:
       return None
 
-    # Cover from start of -3 4H candle (-4 hrs before -2 open) up to close of -2 4H candle
     start_window_time = c_open_time - (4 * 60 * 60 * 1000)
     sweep_15m_candles = [
         c for c in ohlcv_15m if start_window_time <= c[0] < c_close_time
@@ -172,7 +170,7 @@ def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
     latest_close = ohlcv_15m[-2][4]  # Close of last completed 15m candle
 
     if direction == "SHORT":
-      # 1. Identify Highest High (H_max) formed during the sweep
+      # 1. Identify Highest High (H_max)
       max_high = -1.0
       peak_idx = 0
       for i, candle in enumerate(sweep_15m_candles):
@@ -180,7 +178,7 @@ def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
           max_high = candle[2]
           peak_idx = i
 
-      # 2. Search BACKWARDS starting from peak_idx - 1 for the CLOSEST 3-candle pivot low
+      # 2. Search BACKWARDS starting from peak_idx - 1 for CLOSEST 3-candle pivot low
       l_mss = None
       for i in range(peak_idx - 1, 0, -1):
         if i < len(sweep_15m_candles) - 1:
@@ -188,12 +186,10 @@ def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
           left_low = sweep_15m_candles[i - 1][3]
           right_low = sweep_15m_candles[i + 1][3]
 
-          # Strict 3-candle pivot low
           if curr_low < left_low and curr_low < right_low:
             l_mss = curr_low
-            break  # Found the CLOSEST pivot low immediately before peak!
+            break
 
-      # Fallback: Minimum low before peak if no 3-candle pivot formed
       if l_mss is None:
         if peak_idx > 0:
           l_mss = min(c[3] for c in sweep_15m_candles[:peak_idx])
@@ -208,7 +204,11 @@ def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
         )
         return None
 
-      already_mss = latest_close < l_mss
+      # FIX: Check if ANY completed 15m candle after the peak has closed below l_mss
+      post_peak_candles = sweep_15m_candles[peak_idx:]
+      already_mss = any(
+          c[4] < l_mss for c in post_peak_candles
+      ) or latest_close < l_mss
 
       return {
           "h_max": max_high,
@@ -218,7 +218,7 @@ def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
       }
 
     elif direction == "LONG":
-      # 1. Identify Lowest Low (L_min) formed during the sweep
+      # 1. Identify Lowest Low (L_min)
       min_low = float("inf")
       trough_idx = 0
       for i, candle in enumerate(sweep_15m_candles):
@@ -226,7 +226,7 @@ def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
           min_low = candle[3]
           trough_idx = i
 
-      # 2. Search BACKWARDS starting from trough_idx - 1 for the CLOSEST 3-candle pivot high
+      # 2. Search BACKWARDS starting from trough_idx - 1 for CLOSEST 3-candle pivot high
       h_mss = None
       for i in range(trough_idx - 1, 0, -1):
         if i < len(sweep_15m_candles) - 1:
@@ -234,12 +234,10 @@ def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
           left_high = sweep_15m_candles[i - 1][2]
           right_high = sweep_15m_candles[i + 1][2]
 
-          # Strict 3-candle pivot high
           if curr_high > left_high and curr_high > right_high:
             h_mss = curr_high
-            break  # Found the CLOSEST pivot high immediately before trough!
+            break
 
-      # Fallback: Maximum high before trough if no 3-candle pivot formed
       if h_mss is None:
         if trough_idx > 0:
           h_mss = max(c[2] for c in sweep_15m_candles[:trough_idx])
@@ -254,7 +252,11 @@ def extract_15m_levels(symbol, direction, target_4h_candle, prev_4h_level):
         )
         return None
 
-      already_mss = latest_close > h_mss
+      # FIX: Check if ANY completed 15m candle after the trough has closed above h_mss
+      post_trough_candles = sweep_15m_candles[trough_idx:]
+      already_mss = any(
+          c[4] > h_mss for c in post_trough_candles
+      ) or latest_close > h_mss
 
       return {
           "l_min": min_low,
@@ -415,13 +417,13 @@ def check_15m_watchlists():
 
       latest_high = ohlcv_15m[-1][2]
       latest_low = ohlcv_15m[-1][3]
-      latest_close = ohlcv_15m[-2][4]
+      latest_close = ohlcv_15m[-2][4]  # Last completed 15m candle close
 
       # BEARISH WATCHLIST CHECK
       if data["direction"] == "SHORT":
-        if latest_high > data["h_max"]:
+        if latest_close > data["h_max"]:
           print(
-              f"[INVALIDATED SHORT] {symbol} broke above H_max"
+              f"[INVALIDATED SHORT] {symbol} closed above H_max"
               f" ({data['h_max']})."
           )
           symbols_to_remove.append(symbol)
@@ -450,9 +452,9 @@ def check_15m_watchlists():
 
       # BULLISH WATCHLIST CHECK
       elif data["direction"] == "LONG":
-        if latest_low < data["l_min"]:
+        if latest_close < data["l_min"]:
           print(
-              f"[INVALIDATED LONG] {symbol} broke below L_min"
+              f"[INVALIDATED LONG] {symbol} closed below L_min"
               f" ({data['l_min']})."
           )
           symbols_to_remove.append(symbol)
@@ -514,6 +516,10 @@ def run_full_scan():
   send_telegram_alert(summary_msg)
   print(f"Scan complete across {len(watchlist)} quality tokens!")
 
+  # Immediately run watchlist check right after main scan completes
+  if pending_count > 0:
+    threading.Thread(target=check_15m_watchlists, daemon=True).start()
+
 
 # =============================================================
 # 7. SCHEDULER & MAIN EXECUTION
@@ -521,8 +527,8 @@ def run_full_scan():
 def start_scheduler():
   print("=== Starting 24/7 Market Monitor ===")
   send_telegram_alert(
-      "IST Bot Live! Scanning 4H Sweeps with Closest 15m Pivots (-3 Window"
-      " Extended) & Strict Boundary Filters."
+      "IST Bot Live! Full-Window MSS Scanning, Post-Scan Watchlist Re-Check &"
+      " Robust Pivot Extraction Enabled."
   )
 
   last_executed_slot = None
