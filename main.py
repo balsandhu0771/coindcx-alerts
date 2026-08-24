@@ -11,7 +11,13 @@ from flask import Flask, jsonify
 # ---------------------------------------------------------
 TELEGRAM_BOT_TOKEN = "8642933768:AAH3afnXGmaAplHDar9u4uwJ5IZz0M7y7fs"
 TELEGRAM_CHAT_IDS = [7203290966, 630462102]
-PORT = int(os.environ.get("PORT", 8080))
+
+# Robust Port Parsing
+raw_port = os.environ.get("PORT", "8080")
+try:
+    PORT = int(raw_port)
+except Exception:
+    PORT = 8080
 
 # Initialize Binance Futures Client
 exchange = ccxt.binanceusdm({
@@ -46,20 +52,16 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low
     Extracts 15m MSS structural level and verifies boundaries.
     """
     try:
-        # Fetch last 20 15m candles
         ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
         if len(ohlcv_15m) < 16:
             return None
         
-        # 4H window is roughly the 16 candles prior to the current forming candle
         window_15m = ohlcv_15m[-17:-1]
 
         if setup_type == "LONG":
-            # Lowest point during the 4H sweep window
             l_min = min(c[3] for c in window_15m)
             min_idx = [i for i, c in enumerate(window_15m) if c[3] == l_min][0]
             
-            # Find closest swing high before/at the low
             h_mss = None
             for i in range(min_idx, -1, -1):
                 c = window_15m[i]
@@ -69,7 +71,6 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low
             if h_mss is None:
                 return None
 
-            # Boundary filter check: MSS trigger must sit logically above reference low
             if h_mss <= l_ref:
                 print(f"[{symbol}] SKIP LONG: 15m MSS level ({h_mss}) <= Reference Low ({l_ref})")
                 return None
@@ -77,11 +78,9 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low
             return {"l_min": l_min, "h_mss": h_mss, "l_ref": l_ref}
 
         elif setup_type == "SHORT":
-            # Highest point during the 4H sweep window
             h_max = max(c[2] for c in window_15m)
             max_idx = [i for i, c in enumerate(window_15m) if c[2] == h_max][0]
             
-            # Find closest swing low before/at the high
             l_mss = None
             for i in range(max_idx, -1, -1):
                 c = window_15m[i]
@@ -91,7 +90,6 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low
             if l_mss is None:
                 return None
 
-            # Boundary filter check: MSS trigger must sit logically below reference high
             if l_mss >= h_ref:
                 print(f"[{symbol}] SKIP SHORT: 15m MSS level ({l_mss}) >= Reference High ({h_ref})")
                 return None
@@ -104,22 +102,17 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low
 
 def check_liquidity_sweep(symbol):
     try:
-        # Fetch last 5 4H candles
         ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=5)
         if len(ohlcv_4h) < 4:
             return None
 
-        # [-3] = Reference candle, [-2] = Trigger/Sweep candle just closed, [-1] = Current forming candle
         c_ref = ohlcv_4h[-3]
         c_trig = ohlcv_4h[-2]
 
         h_ref, l_ref = c_ref[2], c_ref[3]
         h_trig, l_trig, c_trig_close = c_trig[2], c_trig[3], c_trig[4]
 
-        # 1. LONG SWEEP: Low swept, Closed back inside reference, did not sweep opposite high
         long_sweep = (l_trig < l_ref) and (c_trig_close > l_ref) and (h_trig <= h_ref)
-        
-        # 2. SHORT SWEEP: High swept, Closed back inside reference, did not sweep opposite low
         short_sweep = (h_trig > h_ref) and (c_trig_close < h_ref) and (l_trig >= l_ref)
 
         if not (long_sweep or short_sweep):
@@ -130,7 +123,6 @@ def check_liquidity_sweep(symbol):
         if not levels:
             return None
 
-        # Check if MSS has already triggered on recent 15m candles
         ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=10)
         recent_15m = ohlcv_15m[-5:-1]
         
@@ -160,8 +152,6 @@ def run_full_scan():
     try:
         markets = exchange.load_markets()
         symbols = [s for s, m in markets.items() if m['active'] and s.endswith('/USDT') and m.get('contract', True)]
-        
-        # Filter top ~120 active pairs
         symbols = symbols[:120]
         
         found_setups = []
@@ -199,21 +189,17 @@ def run_15m_check():
             levels = data['levels']
 
             if data['type'] == "LONG":
-                # Invalidation: broke below sweep low
                 if last_closed[3] < levels['l_min']:
                     to_remove.append(sym)
                     continue
-                # MSS Trigger: closed above swing high
                 if c_close > levels['h_mss']:
                     send_telegram_alert(f"🚀 *LONG MSS CONFIRMED: {sym}*\n\nPrice broke & closed above 15m swing high: `{levels['h_mss']}`\nStop Invalid: `{levels['l_min']}`")
                     to_remove.append(sym)
 
             elif data['type'] == "SHORT":
-                # Invalidation: broke above sweep high
                 if last_closed[2] > levels['h_max']:
                     to_remove.append(sym)
                     continue
-                # MSS Trigger: closed below swing low
                 if c_close < levels['l_mss']:
                     send_telegram_alert(f"🔻 *SHORT MSS CONFIRMED: {sym}*\n\nPrice broke & closed below 15m swing low: `{levels['l_mss']}`\nStop Invalid: `{levels['h_max']}`")
                     to_remove.append(sym)
@@ -230,9 +216,7 @@ def run_15m_check():
 def scheduler_loop():
     while True:
         now = datetime.now(timezone.utc)
-        # Check every 15m close (:01, :16, :31, :46)
         if now.minute in [1, 16, 31, 46] and now.second < 20:
-            # Check 4H close windows (00:01, 04:01, 08:01, 12:01, 16:01, 20:01 UTC)
             if now.hour in [0, 4, 8, 12, 16, 20] and now.minute == 1:
                 run_full_scan()
             else:
@@ -241,7 +225,7 @@ def scheduler_loop():
         time.sleep(5)
 
 # ---------------------------------------------------------
-# FLASK WEB APP & DEBUG ROUTES
+# FLASK WEB APP & DIAGNOSTIC ENDPOINTS
 # ---------------------------------------------------------
 app = Flask(__name__)
 
@@ -295,7 +279,6 @@ def debug_token_endpoint(symbol):
         return jsonify({"error": str(e)})
 
 if __name__ == '__main__':
-    # Start scheduler daemon thread
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
     print("=== Starting 24/7 Market Monitor ===")
