@@ -1,10 +1,10 @@
-import os
-import time
-import threading
 from datetime import datetime, timezone
-import requests
+import os
+import threading
+import time
 import ccxt
 from flask import Flask, jsonify
+import requests
 
 # ---------------------------------------------------------
 # CONFIGURATION
@@ -14,313 +14,357 @@ TELEGRAM_CHAT_IDS = [7203290966, 630462102]
 
 raw_port = os.environ.get("PORT", "8080")
 try:
-    PORT = int(raw_port)
+  PORT = int(raw_port)
 except Exception:
-    PORT = 8080
+  PORT = 8080
 
-exchange = ccxt.binanceusdm({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'future'}
-})
+exchange = ccxt.binanceusdm(
+    {"enableRateLimit": True, "options": {"defaultType": "future"}}
+)
 
 active_watchlists = {}  # {symbol: {data}}
+
 
 # ---------------------------------------------------------
 # TELEGRAM NOTIFIER
 # ---------------------------------------------------------
 def send_telegram_alert(message):
-    for chat_id in TELEGRAM_CHAT_IDS:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "Markdown"
-            }
-            requests.post(url, json=payload, timeout=10)
-        except Exception as e:
-            print(f"Failed to send Telegram message to {chat_id}: {e}")
+  for chat_id in TELEGRAM_CHAT_IDS:
+    try:
+      url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+      payload = {
+          "chat_id": chat_id,
+          "text": message,
+          "parse_mode": "Markdown",
+      }
+      requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+      print(f"Failed to send Telegram message to {chat_id}: {e}")
+
 
 # ---------------------------------------------------------
 # STRATEGY LOGIC: 4H SWEEP & 15M MSS
 # ---------------------------------------------------------
-def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low):
-    try:
-        ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
-        if len(ohlcv_15m) < 16:
-            return None
-        
-        window_15m = ohlcv_15m[-17:-1]
+def extract_15m_levels(
+    symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low
+):
+  try:
+    ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe="15m", limit=20)
+    if len(ohlcv_15m) < 16:
+      return None
 
-        if setup_type == "LONG":
-            l_min = min(c[3] for c in window_15m)
-            min_idx = [i for i, c in enumerate(window_15m) if c[3] == l_min][0]
-            
-            h_mss = None
-            for i in range(min_idx, -1, -1):
-                c = window_15m[i]
-                if h_mss is None or c[2] > h_mss:
-                    h_mss = c[2]
-            
-            if h_mss is None or h_mss <= l_ref:
-                return None
+    window_15m = ohlcv_15m[-17:-1]
 
-            # Calculate R:R
-            risk = h_mss - l_min
-            target = h_mss + (2 * risk)  # Default 1:2 Target projection
-            rr_ratio = round((target - h_mss) / risk, 2) if risk > 0 else 0.0
+    if setup_type == "LONG":
+      l_min = min(c[3] for c in window_15m)
+      min_idx = [i for i, c in enumerate(window_15m) if c[3] == l_min][0]
 
-            return {
-                "l_min": l_min,
-                "h_mss": h_mss,
-                "l_ref": l_ref,
-                "entry": h_mss,
-                "stop_loss": l_min,
-                "target": target,
-                "rr_ratio": rr_ratio
-            }
+      h_mss = None
+      for i in range(min_idx, -1, -1):
+        c = window_15m[i]
+        if h_mss is None or c[2] > h_mss:
+          h_mss = c[2]
 
-        elif setup_type == "SHORT":
-            h_max = max(c[2] for c in window_15m)
-            max_idx = [i for i, c in enumerate(window_15m) if c[2] == h_max][0]
-            
-            l_mss = None
-            for i in range(max_idx, -1, -1):
-                c = window_15m[i]
-                if l_mss is None or c[3] < l_mss:
-                    l_mss = c[3]
-
-            if l_mss is None or l_mss >= h_ref:
-                return None
-
-            # Calculate R:R
-            risk = h_max - l_mss
-            target = l_mss - (2 * risk)  # Default 1:2 Target projection
-            rr_ratio = round((l_mss - target) / risk, 2) if risk > 0 else 0.0
-
-            return {
-                "h_max": h_max,
-                "l_mss": l_mss,
-                "h_ref": h_ref,
-                "entry": l_mss,
-                "stop_loss": h_max,
-                "target": target,
-                "rr_ratio": rr_ratio
-            }
-
-    except Exception as e:
-        print(f"Error in extract_15m_levels for {symbol}: {e}")
+      if h_mss is None or h_mss <= l_ref:
         return None
+
+      # Calculate R:R
+      risk = h_mss - l_min
+      target = h_mss + (2 * risk)  # 1:2 Target projection
+      rr_ratio = round((target - h_mss) / risk, 2) if risk > 0 else 0.0
+
+      return {
+          "l_min": l_min,
+          "h_mss": h_mss,
+          "l_ref": l_ref,
+          "entry": h_mss,
+          "stop_loss": l_min,
+          "target": target,
+          "rr_ratio": rr_ratio,
+      }
+
+    elif setup_type == "SHORT":
+      h_max = max(c[2] for c in window_15m)
+      max_idx = [i for i, c in enumerate(window_15m) if c[2] == h_max][0]
+
+      l_mss = None
+      for i in range(max_idx, -1, -1):
+        c = window_15m[i]
+        if l_mss is None or c[3] < l_mss:
+          l_mss = c[3]
+
+      if l_mss is None or l_mss >= h_ref:
+        return None
+
+      # Calculate R:R
+      risk = h_max - l_mss
+      target = l_mss - (2 * risk)  # 1:2 Target projection
+      rr_ratio = round((l_mss - target) / risk, 2) if risk > 0 else 0.0
+
+      return {
+          "h_max": h_max,
+          "l_mss": l_mss,
+          "h_ref": h_ref,
+          "entry": l_mss,
+          "stop_loss": h_max,
+          "target": target,
+          "rr_ratio": rr_ratio,
+      }
+
+  except Exception as e:
+    print(f"Error in extract_15m_levels for {symbol}: {e}")
+    return None
+
 
 def check_liquidity_sweep(symbol):
-    try:
-        ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=5)
-        if len(ohlcv_4h) < 4:
-            return None
+  try:
+    ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe="4h", limit=5)
+    if len(ohlcv_4h) < 4:
+      return None
 
-        c_ref = ohlcv_4h[-3]
-        c_trig = ohlcv_4h[-2]
+    c_ref = ohlcv_4h[-3]
+    c_trig = ohlcv_4h[-2]
 
-        h_ref, l_ref = c_ref[2], c_ref[3]
-        h_trig, l_trig, c_trig_close = c_trig[2], c_trig[3], c_trig[4]
+    h_ref, l_ref = c_ref[2], c_ref[3]
+    h_trig, l_trig, c_trig_close = c_trig[2], c_trig[3], c_trig[4]
 
-        long_sweep = (l_trig < l_ref) and (c_trig_close > l_ref) and (h_trig <= h_ref)
-        short_sweep = (h_trig > h_ref) and (c_trig_close < h_ref) and (l_trig >= l_ref)
+    long_sweep = (
+        (l_trig < l_ref) and (c_trig_close > l_ref) and (h_trig <= h_ref)
+    )
+    short_sweep = (
+        (h_trig > h_ref) and (c_trig_close < h_ref) and (l_trig >= l_ref)
+    )
 
-        if not (long_sweep or short_sweep):
-            return None
+    if not (long_sweep or short_sweep):
+      return None
 
-        setup_type = "LONG" if long_sweep else "SHORT"
-        levels = extract_15m_levels(symbol, setup_type, h_ref, l_ref, h_trig, l_trig)
-        if not levels:
-            return None
+    setup_type = "LONG" if long_sweep else "SHORT"
+    levels = extract_15m_levels(symbol, setup_type, h_ref, l_ref, h_trig, l_trig)
+    if not levels:
+      return None
 
-        ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=10)
-        recent_15m = ohlcv_15m[-5:-1]
-        
-        already_mss = False
-        if setup_type == "LONG":
-            already_mss = any(c[4] > levels['h_mss'] for c in recent_15m)
-        else:
-            already_mss = any(c[4] < levels['l_mss'] for c in recent_15m)
+    ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe="15m", limit=10)
+    recent_15m = ohlcv_15m[-5:-1]
 
-        return {
-            "symbol": symbol,
-            "type": setup_type,
-            "levels": levels,
-            "already_mss": already_mss,
-            "detected_at": datetime.now(timezone.utc)
-        }
+    already_mss = False
+    if setup_type == "LONG":
+      already_mss = any(c[4] > levels["h_mss"] for c in recent_15m)
+    else:
+      already_mss = any(c[4] < levels["l_mss"] for c in recent_15m)
 
-    except Exception as e:
-        print(f"Error checking {symbol}: {e}")
-        return None
+    return {
+        "symbol": symbol,
+        "type": setup_type,
+        "levels": levels,
+        "already_mss": already_mss,
+        "detected_at": datetime.now(timezone.utc),
+    }
+
+  except Exception as e:
+    print(f"Error checking {symbol}: {e}")
+    return None
+
 
 # ---------------------------------------------------------
 # SCAN WORKERS
 # ---------------------------------------------------------
 def run_full_scan():
-    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Starting Full 4H Sweep Scan...")
-    try:
-        markets = exchange.load_markets()
-        symbols = [
-            s for s, m in markets.items()
-            if m.get('active', True)
-            and m.get('quote') == 'USDT'
-            and (m.get('linear', False) or m.get('swap', False) or m.get('contract', False))
-        ]
-        symbols = symbols[:120]
-        
-        found_setups = []
-        for sym in symbols:
-            res = check_liquidity_sweep(sym)
-            if res:
-                found_setups.append(res)
-                active_watchlists[sym] = res
-            time.sleep(0.05)
+  print(
+      f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Starting Full 4H"
+      " Sweep Scan..."
+  )
+  try:
+    markets = exchange.load_markets()
+    symbols = [
+        s
+        for s, m in markets.items()
+        if m.get("active", True)
+        and m.get("quote") == "USDT"
+        and (
+            m.get("linear", False)
+            or m.get("swap", False)
+            or m.get("contract", False)
+        )
+    ]
+    symbols = symbols[:120]
 
-        msg = f"🔍 *4H Market Scan Complete*\n\nTotal Evaluated: `{len(symbols)}` pairs\nSetups Detected: `{len(found_setups)}`\n"
-        
-        if found_setups:
-            for s in found_setups:
-                sym_clean = s['symbol'].split(':')[0]
-                lvl = s['levels']
-                msg += f"\n━━━━━━━━━━━━━━━━━━━━\n"
-                msg += f"🎯 *{sym_clean}* | *{s['type']}*\n"
-                msg += f"• *Trigger / Entry (MSS):* `{lvl['entry']}`\n"
-                msg += f"• *Stop Loss (Invalidation):* `{lvl['stop_loss']}`\n"
-                msg += f"• *Estimated TP (1:2):* `{lvl['target']}`\n"
-                msg += f"• *Risk:Reward:* `1:{lvl['rr_ratio']}`\n"
-                msg += f"• *Immediate Shift:* `{'YES' if s['already_mss'] else 'NO (Watching 15m)'}`"
-        else:
-            msg += "\nNo high-confluence 4H sweeps found matching entry parameters."
-        
-        send_telegram_alert(msg)
-        print("Scan finished and detailed summary dispatched.")
-    except Exception as e:
-        print(f"Scan execution error: {e}")
+    found_setups = []
+    for sym in symbols:
+      res = check_liquidity_sweep(sym)
+      if res:
+        found_setups.append(res)
+        active_watchlists[sym] = res
+      time.sleep(0.05)
+
+    msg = (
+        "🔍 *4H Market Scan Complete*\n\nTotal Evaluated:"
+        f" `{len(symbols)}` pairs\nSetups Detected: `{len(found_setups)}`\n"
+    )
+
+    if found_setups:
+      for s in found_setups:
+        sym_clean = s["symbol"].split(":")[0]
+        lvl = s["levels"]
+        msg += "\n━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"🎯 *{sym_clean}* | *{s['type']}*\n"
+        msg += f"• *Trigger / Entry (MSS):* `{lvl['entry']}`\n"
+        msg += f"• *Stop Loss (Invalidation):* `{lvl['stop_loss']}`\n"
+        msg += f"• *Estimated TP (1:2):* `{lvl['target']}`\n"
+        msg += f"• *Risk:Reward:* `1:{lvl['rr_ratio']}`\n"
+        msg += (
+            "• *Immediate Shift:*"
+            f" `{'YES' if s['already_mss'] else 'NO (Watching 15m)'}`"
+        )
+    else:
+      msg += "\nNo high-confluence 4H sweeps found matching entry parameters."
+
+    send_telegram_alert(msg)
+    print("Scan finished and detailed summary dispatched.")
+  except Exception as e:
+    print(f"Scan execution error: {e}")
+
 
 def run_15m_check():
-    if not active_watchlists:
-        return
-    
-    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Checking 15m Watchlist ({len(active_watchlists)} active)...")
-    to_remove = []
+  if not active_watchlists:
+    return
 
-    for sym, data in list(active_watchlists.items()):
-        try:
-            ohlcv = exchange.fetch_ohlcv(sym, timeframe='15m', limit=3)
-            last_closed = ohlcv[-2]
-            c_close = last_closed[4]
-            levels = data['levels']
-            sym_clean = sym.split(':')[0]
+  print(
+      f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Checking 15m"
+      f" Watchlist ({len(active_watchlists)} active)..."
+  )
+  to_remove = []
 
-            if data['type'] == "LONG":
-                if last_closed[3] < levels['l_min']:
-                    to_remove.append(sym)
-                    continue
-                if c_close > levels['h_mss']:
-                    send_telegram_alert(
-                        f"🚀 *LONG MSS CONFIRMED: {sym_clean}*\n\n"
-                        f"• *Entry Level:* `{levels['entry']}`\n"
-                        f"• *Stop Loss:* `{levels['stop_loss']}`\n"
-                        f"• *Target (1:2):* `{levels['target']}`\n"
-                        f"• *R:R Ratio:* `1:{levels['rr_ratio']}`"
-                    )
-                    to_remove.append(sym)
+  for sym, data in list(active_watchlists.items()):
+    try:
+      ohlcv = exchange.fetch_ohlcv(sym, timeframe="15m", limit=3)
+      last_closed = ohlcv[-2]
+      c_close = last_closed[4]
+      levels = data["levels"]
+      sym_clean = sym.split(":")[0]
 
-            elif data['type'] == "SHORT":
-                if last_closed[2] > levels['h_max']:
-                    to_remove.append(sym)
-                    continue
-                if c_close < levels['l_mss']:
-                    send_telegram_alert(
-                        f"🔻 *SHORT MSS CONFIRMED: {sym_clean}*\n\n"
-                        f"• *Entry Level:* `{levels['entry']}`\n"
-                        f"• *Stop Loss:* `{levels['stop_loss']}`\n"
-                        f"• *Target (1:2):* `{levels['target']}`\n"
-                        f"• *R:R Ratio:* `1:{levels['rr_ratio']}`"
-                    )
-                    to_remove.append(sym)
+      if data["type"] == "LONG":
+        if last_closed[3] < levels["l_min"]:
+          to_remove.append(sym)
+          continue
+        if c_close > levels["h_mss"]:
+          send_telegram_alert(
+              f"🚀 *LONG MSS CONFIRMED: {sym_clean}*\n\n"
+              f"• *Entry Level:* `{levels['entry']}`\n"
+              f"• *Stop Loss:* `{levels['stop_loss']}`\n"
+              f"• *Target (1:2):* `{levels['target']}`\n"
+              f"• *R:R Ratio:* `1:{levels['rr_ratio']}`"
+          )
+          to_remove.append(sym)
 
-        except Exception as e:
-            print(f"Error checking 15m status for {sym}: {e}")
+      elif data["type"] == "SHORT":
+        if last_closed[2] > levels["h_max"]:
+          to_remove.append(sym)
+          continue
+        if c_close < levels["l_mss"]:
+          send_telegram_alert(
+              f"🔻 *SHORT MSS CONFIRMED: {sym_clean}*\n\n"
+              f"• *Entry Level:* `{levels['entry']}`\n"
+              f"• *Stop Loss:* `{levels['stop_loss']}`\n"
+              f"• *Target (1:2):* `{levels['target']}`\n"
+              f"• *R:R Ratio:* `1:{levels['rr_ratio']}`"
+          )
+          to_remove.append(sym)
 
-    for sym in to_remove:
-        active_watchlists.pop(sym, None)
+    except Exception as e:
+      print(f"Error checking 15m status for {sym}: {e}")
+
+  for sym in to_remove:
+    active_watchlists.pop(sym, None)
+
 
 # ---------------------------------------------------------
 # BACKGROUND SCHEDULER
 # ---------------------------------------------------------
 def scheduler_loop():
-    while True:
-        now = datetime.now(timezone.utc)
-        if now.minute in [1, 16, 31, 46] and now.second < 20:
-            if now.hour in [0, 4, 8, 12, 16, 20] and now.minute == 1:
-                run_full_scan()
-            else:
-                run_15m_check()
-            time.sleep(60)
-        time.sleep(5)
+  while True:
+    now = datetime.now(timezone.utc)
+    # Check 1 minute after every 15-minute mark (01, 16, 31, 46)
+    if now.minute in [1, 16, 31, 46] and now.second < 20:
+      # Binance 4H candles close at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+      # Trigger full scan at minute 1 of these hours
+      if now.hour in [0, 4, 8, 12, 16, 20] and now.minute == 1:
+        run_full_scan()
+      else:
+        run_15m_check()
+      time.sleep(60)
+    time.sleep(5)
+
 
 # ---------------------------------------------------------
 # FLASK WEB APP & DIAGNOSTIC ENDPOINTS
 # ---------------------------------------------------------
 app = Flask(__name__)
 
-@app.route('/')
+
+@app.route("/")
 def home():
-    return jsonify({
-        "status": "online",
-        "service": "coindcx-alerts",
-        "active_watchlists": len(active_watchlists),
-        "server_time_utc": datetime.now(timezone.utc).isoformat()
-    })
+  return jsonify({
+      "status": "online",
+      "service": "coindcx-alerts",
+      "active_watchlists": len(active_watchlists),
+      "server_time_utc": datetime.now(timezone.utc).isoformat(),
+  })
 
-@app.route('/trigger-scan')
+
+@app.route("/trigger-scan")
 def trigger_scan():
-    threading.Thread(target=run_full_scan, daemon=True).start()
-    return "Manual 4H Sweep + 15m MSS scan started! Check Telegram in 2 minutes."
+  threading.Thread(target=run_full_scan, daemon=True).start()
+  return "Manual 4H Sweep + 15m MSS scan started! Check Telegram in 2 minutes."
 
-@app.route('/debug-token/<path:symbol>')
+
+@app.route("/debug-token/<path:symbol>")
 def debug_token_endpoint(symbol):
-    clean = symbol.upper().replace('-', '/').split(':')[0]
-    if not clean.endswith('/USDT') and not clean.endswith('USDT'):
-        clean += '/USDT'
-    elif clean.endswith('USDT') and '/' not in clean:
-        clean = clean.replace('USDT', '/USDT')
-        
-    formatted = f"{clean}:USDT"
+  clean = symbol.upper().replace("-", "/").split(":")[0]
+  if not clean.endswith("/USDT") and not clean.endswith("USDT"):
+    clean += "/USDT"
+  elif clean.endswith("USDT") and "/" not in clean:
+    clean = clean.replace("USDT", "/USDT")
 
-    try:
-        ohlcv_4h = exchange.fetch_ohlcv(formatted, timeframe='4h', limit=6)
-        c_ref = ohlcv_4h[-3]
-        c_trig = ohlcv_4h[-2]
+  formatted = f"{clean}:USDT"
 
-        h_ref, l_ref = c_ref[2], c_ref[3]
-        h_trig, l_trig, c_trig_close = c_trig[2], c_trig[3], c_trig[4]
+  try:
+    ohlcv_4h = exchange.fetch_ohlcv(formatted, timeframe="4h", limit=6)
+    c_ref = ohlcv_4h[-3]
+    c_trig = ohlcv_4h[-2]
 
-        long_sweep = bool((l_trig < l_ref) and (c_trig_close > l_ref) and (h_trig <= h_ref))
-        short_sweep = bool((h_trig > h_ref) and (c_trig_close < h_ref) and (l_trig >= l_ref))
+    h_ref, l_ref = c_ref[2], c_ref[3]
+    h_trig, l_trig, c_trig_close = c_trig[2], c_trig[3], c_trig[4]
 
-        eval_result = check_liquidity_sweep(formatted)
+    long_sweep = bool(
+        (l_trig < l_ref) and (c_trig_close > l_ref) and (h_trig <= h_ref)
+    )
+    short_sweep = bool(
+        (h_trig > h_ref) and (c_trig_close < h_ref) and (l_trig >= l_ref)
+    )
 
-        return jsonify({
-            "symbol": formatted,
-            "4h_reference_candle_3": {"high": h_ref, "low": l_ref},
-            "4h_trigger_candle_2": {"high": h_trig, "low": l_trig, "close": c_trig_close},
-            "conditions_met": {
-                "long_sweep": long_sweep,
-                "short_sweep": short_sweep
-            },
-            "passed_full_evaluation": bool(eval_result),
-            "evaluation_details": eval_result
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)})
+    eval_result = check_liquidity_sweep(formatted)
 
-if __name__ == '__main__':
-    t = threading.Thread(target=scheduler_loop, daemon=True)
-    t.start()
-    print("=== Starting 24/7 Market Monitor ===")
-    app.run(host='0.0.0.0', port=PORT)
+    return jsonify({
+        "symbol": formatted,
+        "4h_reference_candle_3": {"high": h_ref, "low": l_ref},
+        "4h_trigger_candle_2": {
+            "high": h_trig,
+            "low": l_trig,
+            "close": c_trig_close,
+        },
+        "conditions_met": {
+            "long_sweep": long_sweep,
+            "short_sweep": short_sweep,
+        },
+        "passed_full_evaluation": bool(eval_result),
+        "evaluation_details": eval_result,
+    })
+  except Exception as e:
+    return jsonify({"error": str(e)})
+
+
+if __name__ == "__main__":
+  t = threading.Thread(target=scheduler_loop, daemon=True)
+  t.start()
+  print("=== Starting 24/7 Market Monitor ===")
+  app.run(host="0.0.0.0", port=PORT)
