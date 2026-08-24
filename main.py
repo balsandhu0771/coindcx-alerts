@@ -45,8 +45,9 @@ exchange = ccxt.binanceusdm({
 })
 
 # In-memory storage for active setups being monitored on 15m candles
-active_watchlists = {}  # Format: {symbol: setup_data_dict}
-scan_history = []       # Stores recent scan telemetry logs
+active_watchlists = {}     # Format: {symbol: setup_data_dict}
+processed_sweeps = set()   # Format: set of (symbol, 4h_candle_timestamp) to avoid duplicate alerts
+scan_history = []          # Stores recent scan telemetry logs
 
 # =====================================================================
 # 2. TELEGRAM DISPATCHER SYSTEM
@@ -80,7 +81,7 @@ def send_telegram_alert(message):
 # =====================================================================
 def fetch_coindcx_top_pairs(limit=120):
     """
-    Fetches market data from CoinDCX API, sorts by 24h volume, 
+    Fetches market data from CoinDCX API, filters strictly to genuine crypto perpetuals,
     and maps tickers to CCXT Binance Futures format.
     """
     try:
@@ -97,14 +98,21 @@ def fetch_coindcx_top_pairs(limit=120):
         data = response.json()
         usdt_pairs = []
 
+        # Stock/Synthetic blacklists to eliminate non-crypto tickers
+        equity_blacklist = {"APPLE", "ADBE", "ASTS", "NVDA", "TSLA", "MSFT", "AMZN", "GOOGL", "META"}
+
         for item in data:
             target_currency = item.get("target_currency_short_name", "")
             base_currency = item.get("base_currency_short_name", "")
             status = item.get("status", "")
 
-            # Filter active USDT pairs
+            # Filter active USDT crypto pairs only
             if target_currency.upper() == "USDT" and status == "active":
-                symbol_name = f"{base_currency.upper()}/USDT:USDT"
+                base_clean = base_currency.upper()
+                if base_clean in equity_blacklist:
+                    continue
+
+                symbol_name = f"{base_clean}/USDT:USDT"
                 try:
                     volume = float(item.get("volume_24_hours", 0) or 0)
                 except (ValueError, TypeError):
@@ -128,27 +136,30 @@ def fetch_coindcx_top_pairs(limit=120):
 
 def get_active_futures_symbols():
     """
-    Primary symbol loader: Attempts CoinDCX top-volume mapping first, 
-    then falls back to Binance USDⓈ-M Futures linear markets.
+    Primary symbol loader: Validates that all candidate pairs actually exist on Binance USDⓈ-M Futures.
     """
-    # 1. Attempt CoinDCX Ranked List
-    coindcx_symbols = fetch_coindcx_top_pairs(limit=120)
-    if coindcx_symbols and len(coindcx_symbols) >= 30:
-        return coindcx_symbols
-
-    # 2. CCXT Binance USDⓈ-M Futures Fallback
     try:
-        logger.info("Loading markets directly from Binance USDⓈ-M exchange...")
+        logger.info("Loading valid perpetual markets directly from Binance USDⓈ-M exchange...")
         markets = exchange.load_markets()
-        symbols = [
+        valid_binance_symbols = {
             s for s, m in markets.items()
             if m.get('active', True)
             and m.get('quote') == 'USDT'
             and (m.get('linear', False) or m.get('swap', False) or m.get('contract', False))
-        ]
-        symbols = sorted(symbols)[:120]
-        logger.info(f"Loaded {len(symbols)} active USDⓈ-M futures pairs directly from Binance.")
-        return symbols
+        }
+
+        # Candidate pool from CoinDCX
+        coindcx_candidates = fetch_coindcx_top_pairs(limit=160)
+        filtered_symbols = [s for s in coindcx_candidates if s in valid_binance_symbols]
+
+        if len(filtered_symbols) >= 30:
+            return filtered_symbols[:120]
+
+        # Fallback to pure Binance volume sorting
+        sorted_binance = sorted(list(valid_binance_symbols))[:120]
+        logger.info(f"Loaded {len(sorted_binance)} confirmed USDⓈ-M futures pairs from Binance.")
+        return sorted_binance
+
     except Exception as e:
         logger.error(f"Error loading Binance futures markets: {e}")
         return [
@@ -169,23 +180,27 @@ def get_active_futures_symbols():
 # =====================================================================
 # 4. 15-MINUTE MARKET STRUCTURE SHIFT (MSS) ENGINE
 # =====================================================================
-def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low):
+def extract_15m_levels(symbol, setup_type, h_ref, l_ref, trig_timestamp):
     """
-    Extracts the highest swing high or lowest swing low within the 4H sweep window
-    and enforces strict boundary constraints to validate the Market Structure Shift.
+    Extracts the highest swing high or lowest swing low inside the exact 4-hour window
+    of the trigger candle so the entry level remains static and reliable.
     """
     try:
-        # Fetch last 20 15m candles
-        ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
+        # Fetch 15m candles starting from the trigger candle open time (4 hours = 16 x 15m bars)
+        # Fetch up to 32 bars to encompass both trigger bar and follow-up bars
+        ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', since=trig_timestamp, limit=20)
         if len(ohlcv_15m) < 16:
-            logger.warning(f"[{symbol}] Insufficient 15m candle history (count: {len(ohlcv_15m)})")
-            return None
+            # Fallback to fetching recent candles if since parameter is constrained
+            ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=24)
+            if len(ohlcv_15m) < 16:
+                logger.warning(f"[{symbol}] Insufficient 15m candle history (count: {len(ohlcv_15m)})")
+                return None
 
-        # 15m window covering the 4H sweep candle (excluding forming bar)
-        window_15m = ohlcv_15m[-17:-1]
+        # Lock exact 16 bars corresponding to that 4H trigger session
+        window_15m = ohlcv_15m[:16]
 
         if setup_type == "LONG":
-            # 1. Absolute lowest point during the 4H sweep bar
+            # 1. Absolute lowest point during that 4H sweep session
             l_min = min(c[3] for c in window_15m)
             min_idx = [i for i, c in enumerate(window_15m) if c[3] == l_min][0]
 
@@ -219,7 +234,7 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low
 
             rr_ratio = round(reward / risk, 2)
             logger.info(
-                f"[{symbol}] LONG MSS Verified | Entry: {h_mss} | "
+                f"[{symbol}] LONG MSS Locked | Entry: {h_mss} | "
                 f"SL: {l_min} | Target: {target} | R:R: 1:{rr_ratio}"
             )
 
@@ -235,7 +250,7 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low
             }
 
         elif setup_type == "SHORT":
-            # 1. Absolute highest point during the 4H sweep bar
+            # 1. Absolute highest point during that 4H sweep session
             h_max = max(c[2] for c in window_15m)
             max_idx = [i for i, c in enumerate(window_15m) if c[2] == h_max][0]
 
@@ -269,7 +284,7 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low
 
             rr_ratio = round(reward / risk, 2)
             logger.info(
-                f"[{symbol}] SHORT MSS Verified | Entry: {l_mss} | "
+                f"[{symbol}] SHORT MSS Locked | Entry: {l_mss} | "
                 f"SL: {h_max} | Target: {target} | R:R: 1:{rr_ratio}"
             )
 
@@ -310,6 +325,7 @@ def check_liquidity_sweep(symbol):
 
         h_ref, l_ref = c_ref[2], c_ref[3]
         h_trig, l_trig, c_trig_close = c_trig[2], c_trig[3], c_trig[4]
+        trig_timestamp = c_trig[0]
 
         # 1. LONG SWEEP: Low swept, Closed inside reference body, did not sweep opposite high
         long_sweep = (l_trig < l_ref) and (c_trig_close > l_ref) and (h_trig <= h_ref)
@@ -326,13 +342,13 @@ def check_liquidity_sweep(symbol):
             f"Ref: [{l_ref}, {h_ref}] | Trig: [{l_trig}, {h_trig}, {c_trig_close}]"
         )
 
-        # Extract 15m MSS structural levels and boundary constraints
-        levels = extract_15m_levels(symbol, setup_type, h_ref, l_ref, h_trig, l_trig)
+        # Extract 15m MSS structural levels tied to the exact 4H trigger session
+        levels = extract_15m_levels(symbol, setup_type, h_ref, l_ref, trig_timestamp)
         if not levels:
             logger.info(f"[{symbol}] 4H Sweep disqualified during 15m structural extraction.")
             return None
 
-        # Check if 15m MSS break already occurred
+        # Check if 15m MSS break already occurred on recent closed candles
         ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=10)
         recent_15m = ohlcv_15m[-5:-1]
 
@@ -347,7 +363,7 @@ def check_liquidity_sweep(symbol):
             "type": setup_type,
             "levels": levels,
             "already_mss": already_mss,
-            "candle_timestamp": c_trig[0],
+            "candle_timestamp": trig_timestamp,
             "detected_at": datetime.now(timezone.utc)
         }
 
@@ -360,7 +376,7 @@ def check_liquidity_sweep(symbol):
 # =====================================================================
 def run_full_scan():
     """
-    Executes full market scan over top volume pairs and dispatches rich Telegram alert.
+    Executes full market scan over verified Binance Futures pairs and prevents repeat alerts for the same candle.
     """
     scan_start = time.time()
     logger.info("=== Starting Full 4H Liquidity Sweep Scan ===")
@@ -371,7 +387,14 @@ def run_full_scan():
         for sym in symbols:
             res = check_liquidity_sweep(sym)
             if res:
-                found_setups.append(res)
+                sweep_id = (sym, res["candle_timestamp"])
+                
+                # Check if this exact 4H sweep setup has already been sent to avoid duplicate alert loops
+                if sweep_id not in processed_sweeps:
+                    found_setups.append(res)
+                    processed_sweeps.add(sweep_id)
+                
+                # Maintain active watchlist for ongoing 15m monitoring
                 active_watchlists[sym] = res
             time.sleep(0.04)
 
@@ -412,14 +435,14 @@ def run_full_scan():
         if len(scan_history) > 20:
             scan_history.pop(0)
 
-        logger.info(f"4H Scan completed in {elapsed}s with {len(found_setups)} setups dispatched.")
+        logger.info(f"4H Scan completed in {elapsed}s with {len(found_setups)} new setups dispatched.")
 
     except Exception as e:
         logger.error(f"Scan Execution Exception: {e}")
 
 def run_15m_check():
     """
-    Monitors all active setups on the watchlist at every 15m candle close.
+    Monitors active watchlist setups on 15m closes and eliminates them upon breakout or invalidation.
     """
     if not active_watchlists:
         return
@@ -578,9 +601,9 @@ if __name__ == '__main__':
     # Dispatch Startup Alert to Telegram
     send_telegram_alert(
         "🚀 *Crypto Trading Bot is Online & Active on Render!* \n\n"
-        "• *Engine:* 4H Sweep + 15m MSS\n"
+        "• *Engine:* 4H Sweep + 15m MSS (Epoch Locked)\n"
         "• *Target System:* Dynamic 4H Opposing Liquidity\n"
-        "• *Coverage:* Top Volume USDT Pairs (CoinDCX / Binance)\n"
+        "• *Coverage:* Top Volume USDⓈ-M Futures Perpetuals\n"
         "• *Status:* 24/7 Monitoring Initialized"
     )
 
