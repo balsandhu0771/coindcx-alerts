@@ -12,20 +12,17 @@ from flask import Flask, jsonify
 TELEGRAM_BOT_TOKEN = "8642933768:AAH3afnXGmaAplHDar9u4uwJ5IZz0M7y7fs"
 TELEGRAM_CHAT_IDS = [7203290966, 630462102]
 
-# Robust Port Parsing
 raw_port = os.environ.get("PORT", "8080")
 try:
     PORT = int(raw_port)
 except Exception:
     PORT = 8080
 
-# Initialize Binance Futures Client
 exchange = ccxt.binanceusdm({
     'enableRateLimit': True,
     'options': {'defaultType': 'future'}
 })
 
-# Global state for tracking setups
 active_watchlists = {}  # {symbol: {data}}
 
 # ---------------------------------------------------------
@@ -48,9 +45,6 @@ def send_telegram_alert(message):
 # STRATEGY LOGIC: 4H SWEEP & 15M MSS
 # ---------------------------------------------------------
 def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low):
-    """
-    Extracts 15m MSS structural level and verifies boundaries.
-    """
     try:
         ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
         if len(ohlcv_15m) < 16:
@@ -68,14 +62,23 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low
                 if h_mss is None or c[2] > h_mss:
                     h_mss = c[2]
             
-            if h_mss is None:
+            if h_mss is None or h_mss <= l_ref:
                 return None
 
-            if h_mss <= l_ref:
-                print(f"[{symbol}] SKIP LONG: 15m MSS level ({h_mss}) <= Reference Low ({l_ref})")
-                return None
+            # Calculate R:R
+            risk = h_mss - l_min
+            target = h_mss + (2 * risk)  # Default 1:2 Target projection
+            rr_ratio = round((target - h_mss) / risk, 2) if risk > 0 else 0.0
 
-            return {"l_min": l_min, "h_mss": h_mss, "l_ref": l_ref}
+            return {
+                "l_min": l_min,
+                "h_mss": h_mss,
+                "l_ref": l_ref,
+                "entry": h_mss,
+                "stop_loss": l_min,
+                "target": target,
+                "rr_ratio": rr_ratio
+            }
 
         elif setup_type == "SHORT":
             h_max = max(c[2] for c in window_15m)
@@ -87,14 +90,23 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref, c_trig_high, c_trig_low
                 if l_mss is None or c[3] < l_mss:
                     l_mss = c[3]
 
-            if l_mss is None:
+            if l_mss is None or l_mss >= h_ref:
                 return None
 
-            if l_mss >= h_ref:
-                print(f"[{symbol}] SKIP SHORT: 15m MSS level ({l_mss}) >= Reference High ({h_ref})")
-                return None
+            # Calculate R:R
+            risk = h_max - l_mss
+            target = l_mss - (2 * risk)  # Default 1:2 Target projection
+            rr_ratio = round((l_mss - target) / risk, 2) if risk > 0 else 0.0
 
-            return {"h_max": h_max, "l_mss": l_mss, "h_ref": h_ref}
+            return {
+                "h_max": h_max,
+                "l_mss": l_mss,
+                "h_ref": h_ref,
+                "entry": l_mss,
+                "stop_loss": h_max,
+                "target": target,
+                "rr_ratio": rr_ratio
+            }
 
     except Exception as e:
         print(f"Error in extract_15m_levels for {symbol}: {e}")
@@ -157,10 +169,7 @@ def run_full_scan():
             and m.get('quote') == 'USDT'
             and (m.get('linear', False) or m.get('swap', False) or m.get('contract', False))
         ]
-        
-        # Limit to top 120 pairs
         symbols = symbols[:120]
-        print(f"Discovered {len(symbols)} active USDT perpetual markets to evaluate.")
         
         found_setups = []
         for sym in symbols:
@@ -171,14 +180,23 @@ def run_full_scan():
             time.sleep(0.05)
 
         msg = f"🔍 *4H Market Scan Complete*\n\nTotal Evaluated: `{len(symbols)}` pairs\nSetups Detected: `{len(found_setups)}`\n"
+        
         if found_setups:
             for s in found_setups:
-                msg += f"\n• *{s['symbol']}* ({s['type']}) | Immediate MSS: `{s['already_mss']}`"
+                sym_clean = s['symbol'].split(':')[0]
+                lvl = s['levels']
+                msg += f"\n━━━━━━━━━━━━━━━━━━━━\n"
+                msg += f"🎯 *{sym_clean}* | *{s['type']}*\n"
+                msg += f"• *Trigger / Entry (MSS):* `{lvl['entry']}`\n"
+                msg += f"• *Stop Loss (Invalidation):* `{lvl['stop_loss']}`\n"
+                msg += f"• *Estimated TP (1:2):* `{lvl['target']}`\n"
+                msg += f"• *Risk:Reward:* `1:{lvl['rr_ratio']}`\n"
+                msg += f"• *Immediate Shift:* `{'YES' if s['already_mss'] else 'NO (Watching 15m)'}`"
         else:
             msg += "\nNo high-confluence 4H sweeps found matching entry parameters."
         
         send_telegram_alert(msg)
-        print("Scan finished and summary dispatched.")
+        print("Scan finished and detailed summary dispatched.")
     except Exception as e:
         print(f"Scan execution error: {e}")
 
@@ -195,13 +213,20 @@ def run_15m_check():
             last_closed = ohlcv[-2]
             c_close = last_closed[4]
             levels = data['levels']
+            sym_clean = sym.split(':')[0]
 
             if data['type'] == "LONG":
                 if last_closed[3] < levels['l_min']:
                     to_remove.append(sym)
                     continue
                 if c_close > levels['h_mss']:
-                    send_telegram_alert(f"🚀 *LONG MSS CONFIRMED: {sym}*\n\nPrice broke & closed above 15m swing high: `{levels['h_mss']}`\nStop Invalid: `{levels['l_min']}`")
+                    send_telegram_alert(
+                        f"🚀 *LONG MSS CONFIRMED: {sym_clean}*\n\n"
+                        f"• *Entry Level:* `{levels['entry']}`\n"
+                        f"• *Stop Loss:* `{levels['stop_loss']}`\n"
+                        f"• *Target (1:2):* `{levels['target']}`\n"
+                        f"• *R:R Ratio:* `1:{levels['rr_ratio']}`"
+                    )
                     to_remove.append(sym)
 
             elif data['type'] == "SHORT":
@@ -209,7 +234,13 @@ def run_15m_check():
                     to_remove.append(sym)
                     continue
                 if c_close < levels['l_mss']:
-                    send_telegram_alert(f"🔻 *SHORT MSS CONFIRMED: {sym}*\n\nPrice broke & closed below 15m swing low: `{levels['l_mss']}`\nStop Invalid: `{levels['h_max']}`")
+                    send_telegram_alert(
+                        f"🔻 *SHORT MSS CONFIRMED: {sym_clean}*\n\n"
+                        f"• *Entry Level:* `{levels['entry']}`\n"
+                        f"• *Stop Loss:* `{levels['stop_loss']}`\n"
+                        f"• *Target (1:2):* `{levels['target']}`\n"
+                        f"• *R:R Ratio:* `1:{levels['rr_ratio']}`"
+                    )
                     to_remove.append(sym)
 
         except Exception as e:
