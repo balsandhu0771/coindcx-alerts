@@ -151,8 +151,16 @@ def run_full_scan():
     print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Starting Full 4H Sweep Scan...")
     try:
         markets = exchange.load_markets()
-        symbols = [s for s, m in markets.items() if m['active'] and s.endswith('/USDT') and m.get('contract', True)]
+        symbols = [
+            s for s, m in markets.items()
+            if m.get('active', True)
+            and m.get('quote') == 'USDT'
+            and (m.get('linear', False) or m.get('swap', False) or m.get('contract', False))
+        ]
+        
+        # Limit to top 120 pairs
         symbols = symbols[:120]
+        print(f"Discovered {len(symbols)} active USDT perpetual markets to evaluate.")
         
         found_setups = []
         for sym in symbols:
@@ -245,11 +253,13 @@ def trigger_scan():
 
 @app.route('/debug-token/<path:symbol>')
 def debug_token_endpoint(symbol):
-    formatted = symbol.upper().replace('-', '/')
-    if not formatted.endswith('USDT'):
-        formatted += '/USDT'
-    if '/' not in formatted:
-        formatted = formatted.replace('USDT', '/USDT')
+    clean = symbol.upper().replace('-', '/').split(':')[0]
+    if not clean.endswith('/USDT') and not clean.endswith('USDT'):
+        clean += '/USDT'
+    elif clean.endswith('USDT') and '/' not in clean:
+        clean = clean.replace('USDT', '/USDT')
+        
+    formatted = f"{clean}:USDT"
 
     try:
         ohlcv_4h = exchange.fetch_ohlcv(formatted, timeframe='4h', limit=6)
