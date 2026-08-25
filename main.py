@@ -25,7 +25,7 @@ TELEGRAM_CHAT_IDS = [7203290966, 630462102]
 # Server Boot Time Tracker for Telemetry
 BOOT_TIME = datetime.now(timezone.utc)
 
-# Robust Port Extraction for Render Hosting
+# Robust Port Extraction for Render Web Services
 raw_port = os.environ.get("PORT", "8080")
 try:
     PORT = int(raw_port)
@@ -44,7 +44,7 @@ exchange = ccxt.binanceusdm({
     }
 })
 
-# In-memory state tracking
+# In-memory storage for active setups being monitored on 15m candles
 active_watchlists = {}     # Format: {symbol: setup_data_dict}
 processed_sweeps = set()   # Format: set of (symbol, 4h_candle_timestamp)
 scan_history = []          # Stores recent scan telemetry logs
@@ -82,33 +82,11 @@ def send_telegram_alert(message):
 # =====================================================================
 def get_all_coindcx_futures_symbols():
     """
-    Fetches every active CoinDCX USDT-Futures token, filters out stock/equity tickers,
-    and validates them against underlying linear contract feeds.
+    Extracts all CoinDCX USDT-settled futures tokens and validates them
+    against active linear futures contracts.
     """
     try:
-        logger.info("Querying CoinDCX markets details for complete active token list...")
-        response = requests.get(COINDCX_MARKETS_URL, timeout=12)
-        
-        # Spot stock equity tickers to exclude
-        equity_blacklist = {
-            "APPLE", "ADBE", "ASTS", "NVDA", "TSLA", "MSFT", "AMZN", 
-            "GOOGL", "META", "COIN", "PLTR", "HOOD", "AMD", "NFLX"
-        }
-
-        coindcx_symbols = set()
-        if response.status_code == 200:
-            data = response.json()
-            for item in data:
-                target_currency = item.get("target_currency_short_name", "")
-                base_currency = item.get("base_currency_short_name", "")
-                status = item.get("status", "")
-
-                if target_currency.upper() == "USDT" and status == "active":
-                    base_clean = base_currency.upper()
-                    if base_clean not in equity_blacklist:
-                        coindcx_symbols.add(f"{base_clean}/USDT:USDT")
-
-        # Load Binance Futures exchange symbols to ensure exact routing
+        logger.info("Loading Binance Futures active linear markets...")
         markets = exchange.load_markets()
         valid_exchange_symbols = {
             s for s, m in markets.items()
@@ -117,21 +95,45 @@ def get_all_coindcx_futures_symbols():
             and (m.get('linear', False) or m.get('swap', False) or m.get('contract', False))
         }
 
-        # Intersect CoinDCX list with exchange feed
-        final_list = [s for s in coindcx_symbols if s in valid_exchange_symbols]
+        # Spot stock equity tickers to exclude
+        equity_blacklist = {
+            "APPLE", "ADBE", "ASTS", "NVDA", "TSLA", "MSFT", "AMZN", 
+            "GOOGL", "META", "COIN", "PLTR", "HOOD", "AMD", "NFLX"
+        }
 
-        # If CoinDCX API was unreachable, fall back to entire Binance linear contract set
-        if len(final_list) < 20:
-            logger.warning("CoinDCX parser returned insufficient symbols. Using full active perpetual list.")
+        coindcx_symbols = set()
+        try:
+            logger.info("Querying CoinDCX markets details...")
+            response = requests.get(COINDCX_MARKETS_URL, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                for item in data:
+                    # In CoinDCX API: base_currency is quote (USDT), target_currency is base token (BTC)
+                    base_cur = str(item.get("base_currency_short_name", "")).upper()
+                    target_cur = str(item.get("target_currency_short_name", "")).upper()
+                    status = str(item.get("status", "")).lower()
+
+                    if (base_cur == "USDT" or target_cur == "USDT") and status == "active":
+                        token_name = target_cur if base_cur == "USDT" else base_cur
+                        if token_name not in equity_blacklist and token_name != "USDT":
+                            coindcx_symbols.add(f"{token_name}/USDT:USDT")
+        except Exception as api_err:
+            logger.warning(f"CoinDCX API request failed ({api_err}), proceeding with exchange list.")
+
+        # Intersect CoinDCX list with active exchange feeds
+        matched_symbols = [s for s in coindcx_symbols if s in valid_exchange_symbols]
+
+        # Use full linear futures catalogue if CoinDCX returns a small subset
+        if len(matched_symbols) < 50:
             final_list = sorted(list(valid_exchange_symbols))
         else:
-            final_list = sorted(final_list)
+            final_list = sorted(matched_symbols)
 
-        logger.info(f"Loaded {len(final_list)} total active CoinDCX crypto tokens for evaluation.")
+        logger.info(f"Successfully loaded {len(final_list)} total active CoinDCX futures pairs.")
         return final_list
 
     except Exception as e:
-        logger.error(f"Symbol extractor exception: {e}")
+        logger.error(f"Symbol extractor fallback exception: {e}")
         try:
             markets = exchange.load_markets()
             return sorted([
@@ -150,7 +152,6 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref):
     and enforces strict boundary constraints to validate the Market Structure Shift.
     """
     try:
-        # Fetch last 32 15m candles to capture the full 4H sweep session
         ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=32)
         if len(ohlcv_15m) < 20:
             return None
@@ -159,25 +160,18 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref):
         window_15m = ohlcv_15m[-17:-1]
 
         if setup_type == "LONG":
-            # 1. Absolute lowest point during the 4H sweep bar
             l_min = min(c[3] for c in window_15m)
             min_idx = [i for i, c in enumerate(window_15m) if c[3] == l_min][0]
 
-            # 2. Highest swing point prior to or at the sweep low
             h_mss = None
             for i in range(min_idx, -1, -1):
                 c = window_15m[i]
                 if h_mss is None or c[2] > h_mss:
                     h_mss = c[2]
 
-            if h_mss is None:
+            if h_mss is None or h_mss <= l_ref:
                 return None
 
-            # 3. Structural Boundary: 15m entry high must sit strictly above reference 4H low
-            if h_mss <= l_ref:
-                return None
-
-            # Genuine Opposing Liquidity Target & Mathematical R:R
             target = h_ref
             risk = h_mss - l_min
             reward = target - h_mss
@@ -199,25 +193,18 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref):
             }
 
         elif setup_type == "SHORT":
-            # 1. Absolute highest point during the 4H sweep bar
             h_max = max(c[2] for c in window_15m)
             max_idx = [i for i, c in enumerate(window_15m) if c[2] == h_max][0]
 
-            # 2. Lowest swing point prior to or at the sweep high
             l_mss = None
             for i in range(max_idx, -1, -1):
                 c = window_15m[i]
                 if l_mss is None or c[3] < l_mss:
                     l_mss = c[3]
 
-            if l_mss is None:
+            if l_mss is None or l_mss >= h_ref:
                 return None
 
-            # 3. Structural Boundary: 15m entry low must sit strictly below reference 4H high
-            if l_mss >= h_ref:
-                return None
-
-            # Genuine Opposing Liquidity Target & Mathematical R:R
             target = l_ref
             risk = h_max - l_mss
             reward = l_mss - target
@@ -254,10 +241,6 @@ def check_liquidity_sweep(symbol):
         if len(ohlcv_4h) < 4:
             return None
 
-        # Candle Indices:
-        # [-3] = Reference Candle
-        # [-2] = Trigger Candle (Just closed)
-        # [-1] = Current forming candle
         c_ref = ohlcv_4h[-3]
         c_trig = ohlcv_4h[-2]
 
@@ -265,10 +248,7 @@ def check_liquidity_sweep(symbol):
         h_trig, l_trig, c_trig_close = c_trig[2], c_trig[3], c_trig[4]
         trig_timestamp = c_trig[0]
 
-        # 1. LONG SWEEP: Low swept, Closed inside reference body, did not sweep opposite high
         long_sweep = (l_trig < l_ref) and (c_trig_close > l_ref) and (h_trig <= h_ref)
-
-        # 2. SHORT SWEEP: High swept, Closed inside reference body, did not sweep opposite low
         short_sweep = (h_trig > h_ref) and (c_trig_close < h_ref) and (l_trig >= l_ref)
 
         if not (long_sweep or short_sweep):
@@ -276,12 +256,10 @@ def check_liquidity_sweep(symbol):
 
         setup_type = "LONG" if long_sweep else "SHORT"
 
-        # Extract 15m MSS structural levels tied to the 4H sweep session
         levels = extract_15m_levels(symbol, setup_type, h_ref, l_ref)
         if not levels:
             return None
 
-        # Check if 15m MSS break already occurred on recent closed candles
         ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=10)
         recent_15m = ohlcv_15m[-5:-1]
 
@@ -309,7 +287,7 @@ def check_liquidity_sweep(symbol):
 # =====================================================================
 def run_full_scan():
     """
-    Executes full market scan over all CoinDCX USDT tokens and prevents duplicate alerts.
+    Executes full market scan over all CoinDCX USDT tokens and dispatches alerts.
     """
     scan_start = time.time()
     logger.info("=== Starting Complete CoinDCX 4H Liquidity Sweep Scan ===")
@@ -329,7 +307,6 @@ def run_full_scan():
 
         elapsed = round(time.time() - scan_start, 1)
 
-        # Build Full Structured Telegram Alert
         msg = "⚡ *COINDCX 4H LIQUIDITY SWEEP SCAN* ⚡\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n"
         msg += f"📊 *Total Pairs Evaluated:* `{len(symbols)}`\n"
@@ -354,7 +331,6 @@ def run_full_scan():
 
         send_telegram_alert(msg)
 
-        # Log telemetry record
         scan_history.append({
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "pairs_evaluated": len(symbols),
@@ -388,13 +364,11 @@ def run_15m_check():
             sym_clean = sym.split(':')[0]
 
             if data['type'] == "LONG":
-                # Invalidation Check: Price closed/pierced below sweep low
                 if last_closed[3] < levels['l_min']:
                     logger.info(f"[{sym}] LONG Setup Invalidated (Broke sweep low).")
                     to_remove.append(sym)
                     continue
 
-                # MSS Break Confirmation: Closed above swing high
                 if c_close > levels['h_mss']:
                     send_telegram_alert(
                         f"🚀 *LONG MSS CONFIRMED: {sym_clean}*\n"
@@ -408,13 +382,11 @@ def run_15m_check():
                     to_remove.append(sym)
 
             elif data['type'] == "SHORT":
-                # Invalidation Check: Price closed/pierced above sweep high
                 if last_closed[2] > levels['h_max']:
                     logger.info(f"[{sym}] SHORT Setup Invalidated (Broke sweep high).")
                     to_remove.append(sym)
                     continue
 
-                # MSS Break Confirmation: Closed below swing low
                 if c_close < levels['l_mss']:
                     send_telegram_alert(
                         f"🔻 *SHORT MSS CONFIRMED: {sym_clean}*\n"
@@ -438,15 +410,13 @@ def run_15m_check():
 # =====================================================================
 def scheduler_loop():
     """
-    Perpetual loop that triggers 4H full scans and 15m checks on candle close.
+    Perpetual loop triggering 4H full scans and 15m checks on candle close.
     """
     global last_scan_hour
     logger.info("Background scheduler thread active.")
     while True:
         now = datetime.now(timezone.utc)
-        # Execute 1 minute past every 15-minute close (:01, :16, :31, :46)
         if now.minute in [1, 16, 31, 46] and now.second < 20:
-            # 4H Binance Candle Close Windows (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
             if now.hour in [0, 4, 8, 12, 16, 20] and now.minute == 1:
                 if last_scan_hour != now.hour:
                     last_scan_hour = now.hour
@@ -530,12 +500,11 @@ def debug_token_endpoint(symbol):
 # 9. PROCESS ENTRYPOINT
 # =====================================================================
 if __name__ == '__main__':
-    # Dispatch Startup Alert to Telegram
     send_telegram_alert(
         "🚀 *Crypto Trading Bot is Online & Active on Render!* \n\n"
         "• *Engine:* 4H Sweep + 15m MSS\n"
         "• *Target System:* Dynamic 4H Opposing Liquidity\n"
-        "• *Coverage:* All Active CoinDCX USDT-Futures Pairs\n"
+        "• *Coverage:* Complete Active CoinDCX Futures Set\n"
         "• *Status:* 24/7 Monitoring Initialized"
     )
 
