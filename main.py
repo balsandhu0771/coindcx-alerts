@@ -30,6 +30,7 @@ except Exception:
 
 exchange = ccxt.binanceusdm({
     'enableRateLimit': True,
+    'rateLimit': 100,
     'options': {
         'defaultType': 'future',
         'adjustForTimeDifference': True
@@ -62,76 +63,67 @@ def send_telegram_alert(message):
             logger.error(f"[TELEGRAM EXCEPTION] Failed to dispatch to {chat_id}: {e}")
 
 # =====================================================================
-# 3. DIRECT ACTIVE USDT CRYPTO PERPETUALS LOADER
+# 3. TOP 150 LIQUID CRYPTO FUTURES (RATE-LIMIT PROTECTED)
 # =====================================================================
 def get_all_futures_symbols():
     """
-    Extracts all genuine crypto USDT perpetual contracts with auto-recovery reload.
+    Fetches Binance Futures volume rankings and returns top 150 crypto perpetuals.
     """
     try:
-        if not exchange.markets:
-            exchange.load_markets()
-
-        valid_symbols = []
+        tickers = exchange.fetch_tickers()
+        valid_pairs = []
         equity_blacklist = {
             "APPLE", "ADBE", "ASTS", "NVDA", "TSLA", "MSFT", "AMZN", 
             "GOOGL", "META", "COIN", "PLTR", "HOOD", "AMD", "NFLX", "BABA"
         }
 
-        for symbol, m in exchange.markets.items():
-            if not m.get('active', True):
-                continue
+        for symbol, data in tickers.items():
+            if symbol.endswith('/USDT:USDT') or (symbol.endswith('/USDT') and ':' not in symbol):
+                base = symbol.split('/')[0]
+                if base.upper() in equity_blacklist or base.isdigit():
+                    continue
 
-            base = m.get('base', '')
-            quote = m.get('quote', '')
-            is_swap = m.get('swap', False) or m.get('linear', False)
-            is_delivery = m.get('delivery', False) or (m.get('future', False) and not is_swap)
+                quote_vol = float(data.get('quoteVolume', 0) or 0)
+                formatted = symbol if ':' in symbol else f"{symbol}:USDT"
+                valid_pairs.append({'symbol': formatted, 'volume': quote_vol})
 
-            if quote == 'USDT' and is_swap and not is_delivery:
-                if base.upper() not in equity_blacklist and not base.isdigit():
-                    formatted = symbol if ':' in symbol else f"{symbol}:USDT"
-                    valid_symbols.append(formatted)
+        valid_pairs.sort(key=lambda x: x['volume'], reverse=True)
+        top_symbols = [x['symbol'] for x in valid_pairs[:150]]
 
-        unique_symbols = sorted(list(set(valid_symbols)))
-        if unique_symbols:
-            logger.info(f"Loaded {len(unique_symbols)} genuine USDT crypto perpetual contracts.")
-            return unique_symbols
+        if top_symbols:
+            logger.info(f"Loaded top {len(top_symbols)} liquid futures pairs.")
+            return top_symbols
 
     except Exception as e:
-        logger.error(f"Error loading perpetual symbols: {e}")
+        logger.error(f"Error loading ranked futures tickers: {e}")
 
-    # Fallback to fresh network reload if cached catalog was empty
     try:
-        markets = exchange.load_markets(reload=True)
-        return sorted([
+        markets = exchange.load_markets()
+        symbols = [
             s if ':' in s else f"{s}:USDT"
             for s, m in markets.items()
             if m.get('active', True) and m.get('quote') == 'USDT' and (m.get('swap', False) or m.get('linear', False))
-        ])
+        ]
+        return symbols[:150]
     except Exception as e:
-        logger.error(f"Reload fallback failed: {e}")
+        logger.error(f"Fallback symbol loader error: {e}")
         return []
 
 # =====================================================================
 # 4. 15-MINUTE MARKET STRUCTURE SHIFT (MSS) ENGINE
 # =====================================================================
 def extract_15m_levels(symbol, setup_type, h_ref, l_ref):
-    """
-    Extracts 15m swing structure corresponding to the 4H sweep session.
-    """
     try:
         ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=24)
         if len(ohlcv_15m) < 17:
             return None
 
-        # Isolate exactly the 16 closed 15m bars of the swept 4H session
         window_15m = ohlcv_15m[-17:-1]
 
         if setup_type == "LONG":
             l_min = min(c[3] for c in window_15m)
             min_idx = [i for i, c in enumerate(window_15m) if c[3] == l_min][0]
 
-            # Highest swing point before or at the lowest point
             h_mss = None
             for i in range(min_idx, -1, -1):
                 c = window_15m[i]
@@ -164,7 +156,6 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref):
             h_max = max(c[2] for c in window_15m)
             max_idx = [i for i, c in enumerate(window_15m) if c[2] == h_max][0]
 
-            # Lowest swing point before or at the highest point
             l_mss = None
             for i in range(max_idx, -1, -1):
                 c = window_15m[i]
@@ -206,7 +197,6 @@ def check_liquidity_sweep(symbol):
         if len(ohlcv_4h) < 4:
             return None
 
-        # Candle indices: [-3] is Reference, [-2] is Trigger (just closed)
         c_ref = ohlcv_4h[-3]
         c_trig = ohlcv_4h[-2]
 
@@ -214,10 +204,7 @@ def check_liquidity_sweep(symbol):
         h_trig, l_trig, c_trig_close = c_trig[2], c_trig[3], c_trig[4]
         trig_timestamp = c_trig[0]
 
-        # 1. LONG SWEEP: Swept reference low, closed above reference low, did NOT sweep reference high
         long_sweep = (l_trig < l_ref) and (c_trig_close > l_ref) and (h_trig <= h_ref)
-
-        # 2. SHORT SWEEP: Swept reference high, closed below reference high, did NOT sweep reference low
         short_sweep = (h_trig > h_ref) and (c_trig_close < h_ref) and (l_trig >= l_ref)
 
         if not (long_sweep or short_sweep):
@@ -260,7 +247,7 @@ def run_full_scan():
 
     is_scan_running = True
     scan_start = time.time()
-    logger.info("=== Starting Complete 4H Liquidity Sweep Scan ===")
+    logger.info("=== Starting Rate-Limited 4H Liquidity Sweep Scan ===")
     try:
         symbols = get_all_futures_symbols()
         found_setups = []
@@ -273,7 +260,7 @@ def run_full_scan():
                     found_setups.append(res)
                     processed_sweeps.add(sweep_id)
                 active_watchlists[sym] = res
-            time.sleep(0.02)
+            time.sleep(0.08)  # Safe pace to avoid rate limits
 
         elapsed = round(time.time() - scan_start, 1)
 
@@ -334,7 +321,6 @@ def run_15m_check():
 
             if data['type'] == "LONG":
                 if last_closed[3] < levels['l_min']:
-                    logger.info(f"[{sym}] LONG Setup Invalidated (Broke sweep low).")
                     to_remove.append(sym)
                     continue
 
@@ -352,7 +338,6 @@ def run_15m_check():
 
             elif data['type'] == "SHORT":
                 if last_closed[2] > levels['h_max']:
-                    logger.info(f"[{sym}] SHORT Setup Invalidated (Broke sweep high).")
                     to_remove.append(sym)
                     continue
 
@@ -382,11 +367,9 @@ def scheduler_loop():
     logger.info("Background scheduler thread active.")
     while True:
         now = datetime.now(timezone.utc)
-        # Check at exactly 1 minute past every 15-minute close (:01, :16, :31, :46)
         if now.minute in [1, 16, 31, 46] and now.second < 20:
             current_epoch_key = f"{now.strftime('%Y%m%d')}_{now.hour}_{now.minute}"
 
-            # 4H Binance Candle Close Windows (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
             if now.hour in [0, 4, 8, 12, 16, 20] and now.minute == 1:
                 if last_scan_epoch != current_epoch_key:
                     last_scan_epoch = current_epoch_key
@@ -429,7 +412,7 @@ def health_check():
 def trigger_scan():
     if is_scan_running:
         return "Scan already running. Please wait for completion."
-    send_telegram_alert("⚡ *Manual scan initiated via Webhook...* Evaluating all USDT perpetual pairs now.")
+    send_telegram_alert("⚡ *Manual scan initiated via Webhook...* Evaluating top 150 liquid pairs now.")
     threading.Thread(target=run_full_scan, daemon=True).start()
     return "Manual 4H Sweep + 15m MSS scan started! Check Telegram in 1-2 minutes."
 
@@ -481,9 +464,9 @@ if __name__ == '__main__':
 
     send_telegram_alert(
         "🚀 *Crypto Trading Bot is Online & Active on Render!* \n\n"
-        "• *Engine:* 4H Sweep + 15m MSS (Fully Audited)\n"
+        "• *Engine:* 4H Sweep + 15m MSS (Rate-Limit Protected)\n"
         "• *Target System:* Dynamic 4H Opposing Liquidity\n"
-        "• *Coverage:* Verified USDT Crypto Perpetuals Universe (~300 Pairs)\n"
+        "• *Coverage:* Top 150 Liquid USDT Crypto Perpetuals\n"
         "• *Status:* 24/7 Monitoring Initialized"
     )
 
