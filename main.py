@@ -78,70 +78,82 @@ def send_telegram_alert(message):
             logger.error(f"[TELEGRAM EXCEPTION] Failed to dispatch message to {chat_id}: {e}")
 
 # =====================================================================
-# 3. FULL COINDCX FUTURES TOKEN EXTRACTOR & MAPPER
+# 3. ROBUST COINDCX & BINANCE PERPETUAL DISCOVERY PIPELINE
 # =====================================================================
 def get_all_coindcx_futures_symbols():
     """
-    Extracts all CoinDCX USDT-settled futures tokens and validates them
-    against active linear futures contracts.
+    Extracts all genuine USDT linear perpetual futures contracts available on CoinDCX / Binance.
     """
     try:
         logger.info("Loading Binance Futures active linear markets...")
         markets = exchange.load_markets()
-        valid_exchange_symbols = {
-            s for s, m in markets.items()
-            if m.get('active', True)
-            and m.get('quote') == 'USDT'
-            and (m.get('linear', False) or m.get('swap', False) or m.get('contract', False))
-        }
+        
+        # Capture all valid linear USDT futures symbols directly from CCXT
+        valid_linear_symbols = []
+        for symbol, m in markets.items():
+            if not m.get('active', True):
+                continue
+            
+            # Format check for Binance USDT-M perpetuals
+            is_usdt = (
+                m.get('quote') == 'USDT' or 
+                m.get('settle') == 'USDT' or 
+                symbol.endswith('/USDT:USDT') or 
+                symbol.endswith('/USDT')
+            )
+            is_contract = m.get('swap', False) or m.get('contract', False) or m.get('linear', False)
+            
+            if is_usdt and is_contract:
+                formatted = symbol if ':' in symbol else f"{symbol}:USDT"
+                valid_linear_symbols.append(formatted)
 
-        # Spot stock equity tickers to exclude
+        valid_linear_symbols = sorted(list(set(valid_linear_symbols)))
+        logger.info(f"Loaded {len(valid_linear_symbols)} active USDT linear perpetual contracts from exchange.")
+
+        # Attempt to filter by CoinDCX listed assets
         equity_blacklist = {
             "APPLE", "ADBE", "ASTS", "NVDA", "TSLA", "MSFT", "AMZN", 
             "GOOGL", "META", "COIN", "PLTR", "HOOD", "AMD", "NFLX"
         }
-
-        coindcx_symbols = set()
+        
         try:
             logger.info("Querying CoinDCX markets details...")
             response = requests.get(COINDCX_MARKETS_URL, timeout=10)
             if response.status_code == 200:
                 data = response.json()
+                coindcx_tokens = set()
                 for item in data:
-                    # In CoinDCX API: base_currency is quote (USDT), target_currency is base token (BTC)
                     base_cur = str(item.get("base_currency_short_name", "")).upper()
                     target_cur = str(item.get("target_currency_short_name", "")).upper()
                     status = str(item.get("status", "")).lower()
 
-                    if (base_cur == "USDT" or target_cur == "USDT") and status == "active":
-                        token_name = target_cur if base_cur == "USDT" else base_cur
-                        if token_name not in equity_blacklist and token_name != "USDT":
-                            coindcx_symbols.add(f"{token_name}/USDT:USDT")
-        except Exception as api_err:
-            logger.warning(f"CoinDCX API request failed ({api_err}), proceeding with exchange list.")
+                    if status == "active" and (base_cur == "USDT" or target_cur == "USDT"):
+                        token = target_cur if base_cur == "USDT" else base_cur
+                        if token not in equity_blacklist and token != "USDT":
+                            coindcx_tokens.add(token)
 
-        # Intersect CoinDCX list with active exchange feeds
-        matched_symbols = [s for s in coindcx_symbols if s in valid_exchange_symbols]
+                # Filter exchange list to tokens listed on CoinDCX
+                matched = [
+                    s for s in valid_linear_symbols 
+                    if s.split('/')[0].split(':')[0] in coindcx_tokens
+                ]
+                
+                if len(matched) >= 30:
+                    logger.info(f"Matched {len(matched)} active CoinDCX futures pairs.")
+                    return matched
+        except Exception as e:
+            logger.warning(f"CoinDCX API lookup error: {e}. Defaulting to full Binance futures list.")
 
-        # Use full linear futures catalogue if CoinDCX returns a small subset
-        if len(matched_symbols) < 50:
-            final_list = sorted(list(valid_exchange_symbols))
-        else:
-            final_list = sorted(matched_symbols)
-
-        logger.info(f"Successfully loaded {len(final_list)} total active CoinDCX futures pairs.")
-        return final_list
+        # Fallback to all valid active contracts if CoinDCX matching is unavailable
+        return valid_linear_symbols
 
     except Exception as e:
-        logger.error(f"Symbol extractor fallback exception: {e}")
-        try:
-            markets = exchange.load_markets()
-            return sorted([
-                s for s, m in markets.items()
-                if m.get('active', True) and m.get('quote') == 'USDT'
-            ])
-        except Exception:
-            return []
+        logger.error(f"Critical error loading futures symbols: {e}")
+        return [
+            "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
+            "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
+            "NEAR/USDT:USDT", "SUI/USDT:USDT", "ENA/USDT:USDT", "LINK/USDT:USDT"
+        ]
 
 # =====================================================================
 # 4. 15-MINUTE MARKET STRUCTURE SHIFT (MSS) ENGINE
@@ -287,7 +299,7 @@ def check_liquidity_sweep(symbol):
 # =====================================================================
 def run_full_scan():
     """
-    Executes full market scan over all CoinDCX USDT tokens and dispatches alerts.
+    Executes full market scan over all active CoinDCX / Binance USDT pairs and dispatches alerts.
     """
     scan_start = time.time()
     logger.info("=== Starting Complete CoinDCX 4H Liquidity Sweep Scan ===")
@@ -364,11 +376,13 @@ def run_15m_check():
             sym_clean = sym.split(':')[0]
 
             if data['type'] == "LONG":
+                # Invalidation Check: Price closed/pierced below sweep low
                 if last_closed[3] < levels['l_min']:
                     logger.info(f"[{sym}] LONG Setup Invalidated (Broke sweep low).")
                     to_remove.append(sym)
                     continue
 
+                # MSS Break Confirmation: Closed above swing high
                 if c_close > levels['h_mss']:
                     send_telegram_alert(
                         f"🚀 *LONG MSS CONFIRMED: {sym_clean}*\n"
@@ -382,11 +396,13 @@ def run_15m_check():
                     to_remove.append(sym)
 
             elif data['type'] == "SHORT":
+                # Invalidation Check: Price closed/pierced above sweep high
                 if last_closed[2] > levels['h_max']:
                     logger.info(f"[{sym}] SHORT Setup Invalidated (Broke sweep high).")
                     to_remove.append(sym)
                     continue
 
+                # MSS Break Confirmation: Closed below swing low
                 if c_close < levels['l_mss']:
                     send_telegram_alert(
                         f"🔻 *SHORT MSS CONFIRMED: {sym_clean}*\n"
