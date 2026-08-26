@@ -30,7 +30,7 @@ except Exception:
 
 exchange = ccxt.binanceusdm({
     'enableRateLimit': True,
-    'rateLimit': 100,
+    'rateLimit': 120,
     'options': {
         'defaultType': 'future',
         'adjustForTimeDifference': True
@@ -42,6 +42,18 @@ processed_sweeps = set()   # set of (symbol, 4h_candle_timestamp)
 scan_history = []
 is_scan_running = False
 last_scan_epoch = ""
+
+# Hardcoded top liquid baseline to guarantee 0 pairs NEVER happens
+FALLBACK_TOP_PAIRS = [
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT", "XRP/USDT:USDT",
+    "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT", "SUI/USDT:USDT", "NEAR/USDT:USDT",
+    "LINK/USDT:USDT", "PEPE/USDT:USDT", "SHIB/USDT:USDT", "WIF/USDT:USDT", "ENA/USDT:USDT",
+    "APT/USDT:USDT", "DOT/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "TRX/USDT:USDT",
+    "MATIC/USDT:USDT", "ARB/USDT:USDT", "OP/USDT:USDT", "FET/USDT:USDT", "RENDER/USDT:USDT",
+    "TAO/USDT:USDT", "INJ/USDT:USDT", "FTM/USDT:USDT", "STX/USDT:USDT", "ORDI/USDT:USDT",
+    "AAVE/USDT:USDT", "UNI/USDT:USDT", "ATOM/USDT:USDT", "SEI/USDT:USDT", "ONDO/USDT:USDT",
+    "ICP/USDT:USDT", "KAS/USDT:USDT", "GALA/USDT:USDT", "POPCAT/USDT:USDT", "BONK/USDT:USDT"
+]
 
 # =====================================================================
 # 2. TELEGRAM DISPATCHER
@@ -63,51 +75,46 @@ def send_telegram_alert(message):
             logger.error(f"[TELEGRAM EXCEPTION] Failed to dispatch to {chat_id}: {e}")
 
 # =====================================================================
-# 3. TOP 150 LIQUID CRYPTO FUTURES (RATE-LIMIT PROTECTED)
+# 3. FAIL-SAFE PAIRS DISCOVERY (NEVER RETURNS 0)
 # =====================================================================
 def get_all_futures_symbols():
     """
-    Fetches Binance Futures volume rankings and returns top 150 crypto perpetuals.
+    Extracts top USDT perpetuals with multi-layer fallbacks.
     """
     try:
-        tickers = exchange.fetch_tickers()
-        valid_pairs = []
+        if not exchange.markets:
+            exchange.load_markets()
+
+        valid_symbols = []
         equity_blacklist = {
             "APPLE", "ADBE", "ASTS", "NVDA", "TSLA", "MSFT", "AMZN", 
             "GOOGL", "META", "COIN", "PLTR", "HOOD", "AMD", "NFLX", "BABA"
         }
 
-        for symbol, data in tickers.items():
-            if symbol.endswith('/USDT:USDT') or (symbol.endswith('/USDT') and ':' not in symbol):
-                base = symbol.split('/')[0]
-                if base.upper() in equity_blacklist or base.isdigit():
-                    continue
+        for symbol, m in exchange.markets.items():
+            if not m.get('active', True):
+                continue
 
-                quote_vol = float(data.get('quoteVolume', 0) or 0)
-                formatted = symbol if ':' in symbol else f"{symbol}:USDT"
-                valid_pairs.append({'symbol': formatted, 'volume': quote_vol})
+            base = m.get('base', '')
+            quote = m.get('quote', '')
+            is_swap = m.get('swap', False) or m.get('linear', False)
+            is_delivery = m.get('delivery', False) or (m.get('future', False) and not is_swap)
 
-        valid_pairs.sort(key=lambda x: x['volume'], reverse=True)
-        top_symbols = [x['symbol'] for x in valid_pairs[:150]]
+            if quote == 'USDT' and is_swap and not is_delivery:
+                if base.upper() not in equity_blacklist and not base.isdigit():
+                    formatted = symbol if ':' in symbol else f"{symbol}:USDT"
+                    valid_symbols.append(formatted)
 
-        if top_symbols:
-            logger.info(f"Loaded top {len(top_symbols)} liquid futures pairs.")
-            return top_symbols
+        unique_symbols = sorted(list(set(valid_symbols)))
+        if len(unique_symbols) >= 30:
+            logger.info(f"Loaded {len(unique_symbols[:150])} perpetual pairs from CCXT markets.")
+            return unique_symbols[:150]
 
     except Exception as e:
-        logger.error(f"Error loading ranked futures tickers: {e}")
+        logger.error(f"CCXT markets discovery error: {e}")
 
-    try:
-        markets = exchange.load_markets()
-        symbols = [
-            s if ':' in s else f"{s}:USDT"
-            for s, m in markets.items()
-            if m.get('active', True) and m.get('quote') == 'USDT' and (m.get('swap', False) or m.get('linear', False))
-        ]
-        return symbols[:150]
-    except Exception as e:
-        logger.error(f"Fallback symbol loader error: {e}")
-        return []
+    logger.warning("Using fallback baseline pairs list.")
+    return FALLBACK_TOP_PAIRS
 
 # =====================================================================
 # 4. 15-MINUTE MARKET STRUCTURE SHIFT (MSS) ENGINE
@@ -247,20 +254,23 @@ def run_full_scan():
 
     is_scan_running = True
     scan_start = time.time()
-    logger.info("=== Starting Rate-Limited 4H Liquidity Sweep Scan ===")
+    logger.info("=== Starting Complete 4H Liquidity Sweep Scan ===")
     try:
         symbols = get_all_futures_symbols()
         found_setups = []
 
         for sym in symbols:
-            res = check_liquidity_sweep(sym)
-            if res:
-                sweep_id = (sym, res["candle_timestamp"])
-                if sweep_id not in processed_sweeps:
-                    found_setups.append(res)
-                    processed_sweeps.add(sweep_id)
-                active_watchlists[sym] = res
-            time.sleep(0.08)  # Safe pace to avoid rate limits
+            try:
+                res = check_liquidity_sweep(sym)
+                if res:
+                    sweep_id = (sym, res["candle_timestamp"])
+                    if sweep_id not in processed_sweeps:
+                        found_setups.append(res)
+                        processed_sweeps.add(sweep_id)
+                    active_watchlists[sym] = res
+            except Exception as item_err:
+                logger.error(f"Error evaluating {sym}: {item_err}")
+            time.sleep(0.08)
 
         elapsed = round(time.time() - scan_start, 1)
 
@@ -412,7 +422,7 @@ def health_check():
 def trigger_scan():
     if is_scan_running:
         return "Scan already running. Please wait for completion."
-    send_telegram_alert("⚡ *Manual scan initiated via Webhook...* Evaluating top 150 liquid pairs now.")
+    send_telegram_alert("⚡ *Manual scan initiated via Webhook...* Evaluating liquid perpetuals now.")
     threading.Thread(target=run_full_scan, daemon=True).start()
     return "Manual 4H Sweep + 15m MSS scan started! Check Telegram in 1-2 minutes."
 
@@ -464,9 +474,9 @@ if __name__ == '__main__':
 
     send_telegram_alert(
         "🚀 *Crypto Trading Bot is Online & Active on Render!* \n\n"
-        "• *Engine:* 4H Sweep + 15m MSS (Rate-Limit Protected)\n"
+        "• *Engine:* 4H Sweep + 15m MSS (Protected)\n"
         "• *Target System:* Dynamic 4H Opposing Liquidity\n"
-        "• *Coverage:* Top 150 Liquid USDT Crypto Perpetuals\n"
+        "• *Coverage:* Top Liquid USDT Crypto Perpetuals\n"
         "• *Status:* 24/7 Monitoring Initialized"
     )
 
