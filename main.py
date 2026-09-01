@@ -71,14 +71,16 @@ def send_telegram_alert(message):
             logger.error(f"[TELEGRAM EXCEPTION] Failed to dispatch message to {chat_id}: {e}")
 
 # =====================================================================
-# 3. DYNAMIC SYMBOL FETCHER WITH >$5M 24H VOLUME FILTER
+# 3. HIGH-SPEED DIRECT VOLUME DISCOVERY (> $5M 24H VOLUME)
 # =====================================================================
 def get_active_futures_symbols():
     """
-    Fetches genuine USDT perpetual markets and filters for 24h volume > $5,000,000 USD.
+    Directly queries Binance 24hr ticker endpoint to extract and rank
+    all active USDT perpetual contracts with volume >= $5,000,000 USD.
     """
     try:
-        tickers = exchange.fetch_tickers()
+        # Lightweight direct API call (Weight: 40, sub-second execution)
+        tickers = exchange.fapiPublicGetTicker24hr()
         valid_symbols = []
 
         equity_blacklist = {
@@ -86,16 +88,17 @@ def get_active_futures_symbols():
             "GOOGL", "META", "COIN", "PLTR", "HOOD", "AMD", "NFLX", "BABA"
         }
 
-        for symbol, data in tickers.items():
-            if symbol.endswith('/USDT:USDT') or (symbol.endswith('/USDT') and ':' not in symbol):
-                base = symbol.split('/')[0]
+        for item in tickers:
+            symbol_raw = item.get('symbol', '')
+            if symbol_raw.endswith('USDT'):
+                base = symbol_raw[:-4]
                 if base.upper() in equity_blacklist or base.isdigit():
                     continue
 
-                quote_vol = float(data.get('quoteVolume', 0) or 0)
+                quote_vol = float(item.get('quoteVolume', 0) or 0)
                 if quote_vol >= MIN_24H_VOLUME_USD:
-                    formatted = symbol if ':' in symbol else f"{symbol}:USDT"
-                    valid_symbols.append({'symbol': formatted, 'volume': quote_vol})
+                    formatted_symbol = f"{base}/USDT:USDT"
+                    valid_symbols.append({'symbol': formatted_symbol, 'volume': quote_vol})
 
         # Rank by volume descending
         valid_symbols.sort(key=lambda x: x['volume'], reverse=True)
@@ -106,15 +109,26 @@ def get_active_futures_symbols():
             return filtered_symbols
 
     except Exception as e:
-        logger.error(f"Volume discovery error: {e}")
+        logger.error(f"High-speed 24h ticker discovery error: {e}")
 
-    # Fallback to liquid baseline if ticker fetch fails
-    return [
-        "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
-        "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
-        "NEAR/USDT:USDT", "SUI/USDT:USDT", "ENA/USDT:USDT", "LINK/USDT:USDT",
-        "PEPE/USDT:USDT", "WIF/USDT:USDT", "APT/USDT:USDT", "FET/USDT:USDT"
-    ]
+    # Safe fallback if API connection suffers brief latency
+    try:
+        if not exchange.markets:
+            exchange.load_markets()
+        symbols = [
+            s for s, m in exchange.markets.items()
+            if m.get('active', True)
+            and m.get('quote') == 'USDT'
+            and (m.get('linear', False) or m.get('swap', False))
+        ]
+        return sorted(symbols)[:120]
+    except Exception as e:
+        logger.error(f"Fallback symbol loader error: {e}")
+        return [
+            "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
+            "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
+            "NEAR/USDT:USDT", "SUI/USDT:USDT", "ENA/USDT:USDT", "LINK/USDT:USDT"
+        ]
 
 # =====================================================================
 # 4. ORIGINAL 15-MINUTE MARKET STRUCTURE SHIFT (MSS) ENGINE
@@ -473,9 +487,14 @@ def debug_token_endpoint(symbol):
 # 9. PROCESS ENTRYPOINT
 # =====================================================================
 if __name__ == '__main__':
+    try:
+        exchange.load_markets()
+    except Exception as e:
+        logger.warning(f"Initial market load exception: {e}")
+
     send_telegram_alert(
         "🚀 *Crypto Trading Bot is Online & Active on Render!* \n\n"
-        "• *Engine:* 4H Sweep + 15m MSS\n"
+        "• *Engine:* 4H Sweep + 15m MSS (Original Logic)\n"
         "• *Target System:* Dynamic 4H Opposing Liquidity\n"
         f"• *Filter:* USDT Futures with 24h Volume > ${MIN_24H_VOLUME_USD:,.0f}\n"
         "• *Status:* 24/7 Monitoring Initialized"
