@@ -32,6 +32,7 @@ except Exception:
 
 # Minimum 24h quote volume threshold ($5,000,000 USD)
 MIN_24H_VOLUME_USD = 5000000
+BINANCE_FAPI_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
 
 # Initialize CCXT Binance USDⓈ-M Futures Exchange Client
 exchange = ccxt.binanceusdm({
@@ -71,47 +72,47 @@ def send_telegram_alert(message):
             logger.error(f"[TELEGRAM EXCEPTION] Failed to dispatch message to {chat_id}: {e}")
 
 # =====================================================================
-# 3. HIGH-SPEED DIRECT VOLUME DISCOVERY (> $5M 24H VOLUME)
+# 3. DIRECT HIGH-SPEED BINANCE VOLUME DISCOVERY (> $5M 24H VOLUME)
 # =====================================================================
 def get_active_futures_symbols():
     """
-    Directly queries Binance 24hr ticker endpoint to extract and rank
+    Directly queries Binance Futures 24hr ticker REST API to extract and rank
     all active USDT perpetual contracts with volume >= $5,000,000 USD.
     """
     try:
-        # Lightweight direct API call (Weight: 40, sub-second execution)
-        tickers = exchange.fapiPublicGetTicker24hr()
-        valid_symbols = []
+        res = requests.get(BINANCE_FAPI_TICKER_URL, timeout=10)
+        if res.status_code == 200:
+            tickers = res.json()
+            valid_symbols = []
 
-        equity_blacklist = {
-            "APPLE", "ADBE", "ASTS", "NVDA", "TSLA", "MSFT", "AMZN", 
-            "GOOGL", "META", "COIN", "PLTR", "HOOD", "AMD", "NFLX", "BABA"
-        }
+            equity_blacklist = {
+                "APPLE", "ADBE", "ASTS", "NVDA", "TSLA", "MSFT", "AMZN", 
+                "GOOGL", "META", "COIN", "PLTR", "HOOD", "AMD", "NFLX", "BABA"
+            }
 
-        for item in tickers:
-            symbol_raw = item.get('symbol', '')
-            if symbol_raw.endswith('USDT'):
-                base = symbol_raw[:-4]
-                if base.upper() in equity_blacklist or base.isdigit():
-                    continue
+            for item in tickers:
+                symbol_raw = item.get('symbol', '')
+                if symbol_raw.endswith('USDT'):
+                    base = symbol_raw[:-4]
+                    if base.upper() in equity_blacklist or base.isdigit():
+                        continue
 
-                quote_vol = float(item.get('quoteVolume', 0) or 0)
-                if quote_vol >= MIN_24H_VOLUME_USD:
-                    formatted_symbol = f"{base}/USDT:USDT"
-                    valid_symbols.append({'symbol': formatted_symbol, 'volume': quote_vol})
+                    quote_vol = float(item.get('quoteVolume', 0) or 0)
+                    if quote_vol >= MIN_24H_VOLUME_USD:
+                        formatted_symbol = f"{base}/USDT:USDT"
+                        valid_symbols.append({'symbol': formatted_symbol, 'volume': quote_vol})
 
-        # Rank by volume descending
-        valid_symbols.sort(key=lambda x: x['volume'], reverse=True)
-        filtered_symbols = [x['symbol'] for x in valid_symbols]
+            # Sort descending by 24h turnover volume (highest liquidity first)
+            valid_symbols.sort(key=lambda x: x['volume'], reverse=True)
+            filtered_symbols = [x['symbol'] for x in valid_symbols]
 
-        if filtered_symbols:
-            logger.info(f"Loaded {len(filtered_symbols)} liquid pairs exceeding ${MIN_24H_VOLUME_USD:,.0f} 24h volume.")
-            return filtered_symbols
-
+            if filtered_symbols:
+                logger.info(f"Loaded {len(filtered_symbols)} liquid pairs exceeding ${MIN_24H_VOLUME_USD:,.0f} 24h volume.")
+                return filtered_symbols
     except Exception as e:
-        logger.error(f"High-speed 24h ticker discovery error: {e}")
+        logger.error(f"Direct Binance 24h ticker discovery error: {e}")
 
-    # Safe fallback if API connection suffers brief latency
+    # Fallback to CCXT if direct REST API times out
     try:
         if not exchange.markets:
             exchange.load_markets()
@@ -121,13 +122,14 @@ def get_active_futures_symbols():
             and m.get('quote') == 'USDT'
             and (m.get('linear', False) or m.get('swap', False))
         ]
-        return sorted(symbols)[:120]
+        return sorted(symbols)[:140]
     except Exception as e:
         logger.error(f"Fallback symbol loader error: {e}")
         return [
             "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
             "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
-            "NEAR/USDT:USDT", "SUI/USDT:USDT", "ENA/USDT:USDT", "LINK/USDT:USDT"
+            "NEAR/USDT:USDT", "SUI/USDT:USDT", "ENA/USDT:USDT", "LINK/USDT:USDT",
+            "PEPE/USDT:USDT", "WIF/USDT:USDT", "APT/USDT:USDT", "FET/USDT:USDT"
         ]
 
 # =====================================================================
@@ -494,7 +496,7 @@ if __name__ == '__main__':
 
     send_telegram_alert(
         "🚀 *Crypto Trading Bot is Online & Active on Render!* \n\n"
-        "• *Engine:* 4H Sweep + 15m MSS (Original Logic)\n"
+        "• *Engine:* 4H Sweep + 15m MSS (Direct Binance Volume Ranking)\n"
         "• *Target System:* Dynamic 4H Opposing Liquidity\n"
         f"• *Filter:* USDT Futures with 24h Volume > ${MIN_24H_VOLUME_USD:,.0f}\n"
         "• *Status:* 24/7 Monitoring Initialized"
