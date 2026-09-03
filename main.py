@@ -5,7 +5,6 @@ import logging
 import threading
 from datetime import datetime, timezone
 import requests
-import ccxt
 from flask import Flask, jsonify
 
 # =====================================================================
@@ -30,19 +29,9 @@ try:
 except Exception:
     PORT = 8080
 
-# Minimum 24h quote volume threshold ($5,000,000 USD)
-MIN_24H_VOLUME_USD = 5000000
-BINANCE_FAPI_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-
-# Initialize CCXT Binance USDⓈ-M Futures Exchange Client
-exchange = ccxt.binanceusdm({
-    'enableRateLimit': True,
-    'rateLimit': 80,
-    'options': {
-        'defaultType': 'future',
-        'adjustForTimeDifference': True
-    }
-})
+# CoinDCX Public Endpoints (Bypasses Binance Data-Center IP Bans Completely)
+COINDCX_MARKETS_URL = "https://api.coindcx.com/exchange/v1/markets_details"
+COINDCX_CANDLES_URL = "https://public.coindcx.com/market_data/candles"
 
 active_watchlists = {}  # {symbol: setup_data_dict}
 processed_sweeps = set()
@@ -72,72 +61,94 @@ def send_telegram_alert(message):
             logger.error(f"[TELEGRAM EXCEPTION] Failed to dispatch message to {chat_id}: {e}")
 
 # =====================================================================
-# 3. DIRECT HIGH-SPEED BINANCE VOLUME DISCOVERY (> $5M 24H VOLUME)
+# 3. NATIVE COINDCX CANDLE FETCHER (Zero 418 IP Ban Risk)
+# =====================================================================
+def fetch_coindcx_ohlcv(symbol_base, interval='4h', limit=20):
+    """
+    Fetches raw OHLCV candles directly from CoinDCX's public endpoint.
+    Format returned: [[timestamp, open, high, low, close, volume], ...] sorted chronologically.
+    """
+    clean_base = symbol_base.upper().replace('/USDT:USDT', '').replace('/USDT', '').replace('USDT', '')
+    pair = f"B-{clean_base}_USDT"
+
+    try:
+        params = {
+            "pair": pair,
+            "interval": interval,
+            "limit": limit
+        }
+        res = requests.get(COINDCX_CANDLES_URL, params=params, timeout=8)
+        if res.status_code == 200:
+            data = res.json()
+            if not isinstance(data, list) or len(data) == 0:
+                return []
+
+            # CoinDCX returns objects: {'open': x, 'high': x, 'low': x, 'close': x, 'volume': x, 'time': ms}
+            # Often returned descending; sort chronologically (oldest -> newest)
+            candles = []
+            for c in data:
+                t = int(c.get('time', 0))
+                o = float(c.get('open', 0))
+                h = float(c.get('high', 0))
+                l = float(c.get('low', 0))
+                cl = float(c.get('close', 0))
+                v = float(c.get('volume', 0))
+                candles.append([t, o, h, l, cl, v])
+
+            candles.sort(key=lambda x: x[0])
+            return candles
+        else:
+            logger.warning(f"CoinDCX candle fetch status {res.status_code} for {pair}")
+            return []
+    except Exception as e:
+        logger.error(f"Error fetching candles for {pair}: {e}")
+        return []
+
+# =====================================================================
+# 4. ACTIVE LIQUID FUTURES SYMBOLS FETCHER
 # =====================================================================
 def get_active_futures_symbols():
     """
-    Directly queries Binance Futures 24hr ticker REST API to extract and rank
-    all active USDT perpetual contracts with volume >= $5,000,000 USD.
+    Extracts all active Binance-backed USDT perpetual contracts from CoinDCX.
     """
     try:
-        res = requests.get(BINANCE_FAPI_TICKER_URL, timeout=10)
+        res = requests.get(COINDCX_MARKETS_URL, timeout=10)
         if res.status_code == 200:
-            tickers = res.json()
-            valid_symbols = []
-
+            data = res.json()
+            symbols = []
             equity_blacklist = {
                 "APPLE", "ADBE", "ASTS", "NVDA", "TSLA", "MSFT", "AMZN", 
                 "GOOGL", "META", "COIN", "PLTR", "HOOD", "AMD", "NFLX", "BABA"
             }
 
-            for item in tickers:
-                symbol_raw = item.get('symbol', '')
-                if symbol_raw.endswith('USDT'):
-                    base = symbol_raw[:-4]
-                    if base.upper() in equity_blacklist or base.isdigit():
-                        continue
+            for item in data:
+                base = item.get("target_currency_short_name", "")
+                quote = item.get("base_currency_short_name", "")
+                status = item.get("status", "")
+                ecode = item.get("ecode", "")
 
-                    quote_vol = float(item.get('quoteVolume', 0) or 0)
-                    if quote_vol >= MIN_24H_VOLUME_USD:
-                        formatted_symbol = f"{base}/USDT:USDT"
-                        valid_symbols.append({'symbol': formatted_symbol, 'volume': quote_vol})
+                if quote == "USDT" and status == "active" and ecode in ["B", "BA"]:
+                    if base.upper() not in equity_blacklist and not base.isdigit():
+                        symbols.append(base.upper())
 
-            # Sort descending by 24h turnover volume (highest liquidity first)
-            valid_symbols.sort(key=lambda x: x['volume'], reverse=True)
-            filtered_symbols = [x['symbol'] for x in valid_symbols]
-
-            if filtered_symbols:
-                logger.info(f"Loaded {len(filtered_symbols)} liquid pairs exceeding ${MIN_24H_VOLUME_USD:,.0f} 24h volume.")
-                return filtered_symbols
+            unique_symbols = sorted(list(set(symbols)))
+            if unique_symbols:
+                logger.info(f"Loaded {len(unique_symbols)} active USDT pairs from CoinDCX.")
+                return unique_symbols
     except Exception as e:
-        logger.error(f"Direct Binance 24h ticker discovery error: {e}")
+        logger.error(f"CoinDCX market list error: {e}")
 
-    # Fallback to CCXT if direct REST API times out
-    try:
-        if not exchange.markets:
-            exchange.load_markets()
-        symbols = [
-            s for s, m in exchange.markets.items()
-            if m.get('active', True)
-            and m.get('quote') == 'USDT'
-            and (m.get('linear', False) or m.get('swap', False))
-        ]
-        return sorted(symbols)[:140]
-    except Exception as e:
-        logger.error(f"Fallback symbol loader error: {e}")
-        return [
-            "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
-            "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "AVAX/USDT:USDT",
-            "NEAR/USDT:USDT", "SUI/USDT:USDT", "ENA/USDT:USDT", "LINK/USDT:USDT",
-            "PEPE/USDT:USDT", "WIF/USDT:USDT", "APT/USDT:USDT", "FET/USDT:USDT"
-        ]
+    return [
+        "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX",
+        "NEAR", "SUI", "ENA", "LINK", "PEPE", "WIF", "APT", "FET"
+    ]
 
 # =====================================================================
-# 4. ORIGINAL 15-MINUTE MARKET STRUCTURE SHIFT (MSS) ENGINE
+# 5. ORIGINAL 15-MINUTE MARKET STRUCTURE SHIFT (MSS) ENGINE
 # =====================================================================
-def extract_15m_levels(symbol, setup_type, h_ref, l_ref):
+def extract_15m_levels(symbol_base, setup_type, h_ref, l_ref):
     try:
-        ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=20)
+        ohlcv_15m = fetch_coindcx_ohlcv(symbol_base, interval='15m', limit=20)
         if len(ohlcv_15m) < 16:
             return None
 
@@ -209,15 +220,15 @@ def extract_15m_levels(symbol, setup_type, h_ref, l_ref):
             }
 
     except Exception as e:
-        logger.error(f"[{symbol}] Error in extract_15m_levels: {e}")
+        logger.error(f"[{symbol_base}] Error in extract_15m_levels: {e}")
         return None
 
 # =====================================================================
-# 5. ORIGINAL 4H LIQUIDITY SWEEP EVALUATOR
+# 6. ORIGINAL 4H LIQUIDITY SWEEP EVALUATOR
 # =====================================================================
-def check_liquidity_sweep(symbol):
+def check_liquidity_sweep(symbol_base):
     try:
-        ohlcv_4h = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=5)
+        ohlcv_4h = fetch_coindcx_ohlcv(symbol_base, interval='4h', limit=5)
         if len(ohlcv_4h) < 4:
             return None
 
@@ -236,12 +247,12 @@ def check_liquidity_sweep(symbol):
             return None
 
         setup_type = "LONG" if long_sweep else "SHORT"
-        levels = extract_15m_levels(symbol, setup_type, h_ref, l_ref)
+        levels = extract_15m_levels(symbol_base, setup_type, h_ref, l_ref)
         if not levels:
             return None
 
         # Check if 15m MSS break already occurred
-        ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=10)
+        ohlcv_15m = fetch_coindcx_ohlcv(symbol_base, interval='15m', limit=10)
         recent_15m = ohlcv_15m[-5:-1]
 
         already_mss = False
@@ -250,8 +261,10 @@ def check_liquidity_sweep(symbol):
         else:
             already_mss = any(c[4] < levels['l_mss'] for c in recent_15m)
 
+        formatted_symbol = f"{symbol_base}/USDT:USDT"
         return {
-            "symbol": symbol,
+            "symbol": formatted_symbol,
+            "base": symbol_base,
             "type": setup_type,
             "levels": levels,
             "already_mss": already_mss,
@@ -260,11 +273,11 @@ def check_liquidity_sweep(symbol):
         }
 
     except Exception as e:
-        logger.error(f"[{symbol}] Error in check_liquidity_sweep: {e}")
+        logger.error(f"[{symbol_base}] Error in check_liquidity_sweep: {e}")
         return None
 
 # =====================================================================
-# 6. MARKET SCAN WORKERS
+# 7. MARKET SCAN WORKERS
 # =====================================================================
 def run_full_scan():
     global is_scan_running
@@ -273,23 +286,23 @@ def run_full_scan():
 
     is_scan_running = True
     scan_start = time.time()
-    logger.info("=== Starting Rate-Limited 4H Liquidity Sweep Scan ===")
+    logger.info("=== Starting CoinDCX 4H Liquidity Sweep Scan ===")
     try:
         symbols = get_active_futures_symbols()
         found_setups = []
 
-        for sym in symbols:
+        for base in symbols:
             try:
-                res = check_liquidity_sweep(sym)
+                res = check_liquidity_sweep(base)
                 if res:
-                    sweep_id = (sym, res["candle_timestamp"])
+                    sweep_id = (res["symbol"], res["candle_timestamp"])
                     if sweep_id not in processed_sweeps:
                         found_setups.append(res)
                         processed_sweeps.add(sweep_id)
-                    active_watchlists[sym] = res
+                    active_watchlists[res["symbol"]] = res
             except Exception as e:
-                logger.error(f"Error scanning {sym}: {e}")
-            time.sleep(0.05)  # Enforce 0.05s pacing delay
+                logger.error(f"Error scanning {base}: {e}")
+            time.sleep(0.04)
 
         elapsed = round(time.time() - scan_start, 1)
 
@@ -341,7 +354,11 @@ def run_15m_check():
 
     for sym, data in list(active_watchlists.items()):
         try:
-            ohlcv = exchange.fetch_ohlcv(sym, timeframe='15m', limit=3)
+            base = data.get("base", sym.split('/')[0])
+            ohlcv = fetch_coindcx_ohlcv(base, interval='15m', limit=3)
+            if len(ohlcv) < 2:
+                continue
+
             last_closed = ohlcv[-2]
             c_close = last_closed[4]
             levels = data['levels']
@@ -390,18 +407,16 @@ def run_15m_check():
         active_watchlists.pop(sym, None)
 
 # =====================================================================
-# 7. 24/7 BACKGROUND SCHEDULING THREAD
+# 8. 24/7 BACKGROUND SCHEDULING THREAD
 # =====================================================================
 def scheduler_loop():
     global last_scan_epoch
     logger.info("Background scheduler thread active.")
     while True:
         now = datetime.now(timezone.utc)
-        # Check at exactly 1 minute past every 15-minute close (:01, :16, :31, :46)
         if now.minute in [1, 16, 31, 46] and now.second < 20:
             current_epoch_key = f"{now.strftime('%Y%m%d')}_{now.hour}_{now.minute}"
 
-            # 4H Binance Candle Close Windows (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
             if now.hour in [0, 4, 8, 12, 16, 20] and now.minute == 1:
                 if last_scan_epoch != current_epoch_key:
                     last_scan_epoch = current_epoch_key
@@ -414,7 +429,7 @@ def scheduler_loop():
         time.sleep(5)
 
 # =====================================================================
-# 8. FLASK SERVER & WEBHOOK DIAGNOSTICS
+# 9. FLASK SERVER & WEBHOOK DIAGNOSTICS
 # =====================================================================
 app = Flask(__name__)
 
@@ -423,7 +438,7 @@ def home():
     uptime = str(datetime.now(timezone.utc) - BOOT_TIME).split('.')[0]
     return jsonify({
         "status": "online",
-        "service": "crypto-alerts-24-7",
+        "service": "crypto-alerts-coindcx-native",
         "active_watchlists_count": len(active_watchlists),
         "uptime": uptime,
         "server_time_utc": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -444,22 +459,20 @@ def health_check():
 def trigger_scan():
     if is_scan_running:
         return "Scan already running. Please wait for completion."
-    send_telegram_alert("⚡ *Manual scan initiated via Webhook...* Evaluating liquid pairs now.")
+    send_telegram_alert("⚡ *Manual scan initiated via Webhook...* Evaluating pairs now.")
     threading.Thread(target=run_full_scan, daemon=True).start()
     return "Manual 4H Sweep + 15m MSS scan started! Check Telegram in 1-2 minutes."
 
 @app.route('/debug-token/<path:symbol>')
 def debug_token_endpoint(symbol):
     clean = symbol.upper().replace('-', '/').split(':')[0]
-    if not clean.endswith('/USDT') and not clean.endswith('USDT'):
-        clean += '/USDT'
-    elif clean.endswith('USDT') and '/' not in clean:
-        clean = clean.replace('USDT', '/USDT')
-
-    formatted = f"{clean}:USDT"
+    base = clean.replace('/USDT', '').replace('USDT', '')
 
     try:
-        ohlcv_4h = exchange.fetch_ohlcv(formatted, timeframe='4h', limit=6)
+        ohlcv_4h = fetch_coindcx_ohlcv(base, interval='4h', limit=6)
+        if len(ohlcv_4h) < 4:
+            return jsonify({"error": f"Insufficient candle data returned for {base}"})
+
         c_ref = ohlcv_4h[-3]
         c_trig = ohlcv_4h[-2]
 
@@ -469,10 +482,11 @@ def debug_token_endpoint(symbol):
         long_sweep = bool((l_trig < l_ref) and (c_trig_close > l_ref))
         short_sweep = bool((h_trig > h_ref) and (c_trig_close < h_ref))
 
-        eval_result = check_liquidity_sweep(formatted)
+        eval_result = check_liquidity_sweep(base)
 
         return jsonify({
-            "symbol": formatted,
+            "symbol": f"{base}/USDT:USDT",
+            "coindcx_pair": f"B-{base}_USDT",
             "4h_reference_candle_3": {"high": h_ref, "low": l_ref},
             "4h_trigger_candle_2": {"high": h_trig, "low": l_trig, "close": c_trig_close},
             "conditions_met": {
@@ -486,20 +500,14 @@ def debug_token_endpoint(symbol):
         return jsonify({"error": str(e)})
 
 # =====================================================================
-# 9. PROCESS ENTRYPOINT
+# 10. PROCESS ENTRYPOINT
 # =====================================================================
 if __name__ == '__main__':
-    try:
-        exchange.load_markets()
-    except Exception as e:
-        logger.warning(f"Initial market load exception: {e}")
-
     send_telegram_alert(
         "🚀 *Crypto Trading Bot is Online & Active on Render!* \n\n"
-        "• *Engine:* 4H Sweep + 15m MSS (Direct Binance Volume Ranking)\n"
+        "• *Engine:* 4H Sweep + 15m MSS (CoinDCX Native Feed)\n"
         "• *Target System:* Dynamic 4H Opposing Liquidity\n"
-        f"• *Filter:* USDT Futures with 24h Volume > ${MIN_24H_VOLUME_USD:,.0f}\n"
-        "• *Status:* 24/7 Monitoring Initialized"
+        "• *Status:* Clean IP Route Active (No Binance 418 Bans)"
     )
 
     t = threading.Thread(target=scheduler_loop, daemon=True)
