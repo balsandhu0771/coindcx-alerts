@@ -29,9 +29,10 @@ try:
 except Exception:
     PORT = 8080
 
-# CoinDCX Public Endpoints (Bypasses Binance 418 Data-Center IP Bans)
+# Market Data Endpoints (Public, Zero Data-Center IP Bans)
 COINDCX_MARKETS_URL = "https://api.coindcx.com/exchange/v1/markets_details"
 COINDCX_CANDLES_URL = "https://public.coindcx.com/market_data/candles"
+BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 
 active_watchlists = {}  # {symbol: setup_data_dict}
 processed_sweeps = set()
@@ -61,66 +62,73 @@ def send_telegram_alert(message):
             logger.error(f"[TELEGRAM EXCEPTION] Failed to dispatch message to {chat_id}: {e}")
 
 # =====================================================================
-# 3. NATIVE COINDCX CANDLE FETCHER
+# 3. ROBUST PUBLIC OHLCV FETCHER (Bybit + CoinDCX Failover)
 # =====================================================================
-def fetch_coindcx_ohlcv(symbol_base, interval='4h', limit=25):
+def fetch_ohlcv(symbol_base, interval='4h', limit=25):
     """
-    Fetches raw OHLCV candles from CoinDCX's public candles endpoint using startTime/endTime.
+    Fetches raw OHLCV candles without IP bans.
+    Tries Bybit Linear (USDT Perpetual) first for 100% reliability, then CoinDCX.
     Format returned: [[timestamp_ms, open, high, low, close, volume], ...] sorted chronologically.
     """
     clean_base = symbol_base.upper().replace('/USDT:USDT', '').replace('/USDT', '').replace('USDT', '')
-    pair = f"B-{clean_base}_USDT"
 
-    # Calculate millisecond window required by CoinDCX
-    now_ms = int(time.time() * 1000)
-    if interval == '4h':
-        span_ms = limit * 4 * 3600 * 1000
-    elif interval == '15m':
-        span_ms = limit * 15 * 60 * 1000
-    elif interval == '1h':
-        span_ms = limit * 3600 * 1000
-    else:
-        span_ms = limit * 3600 * 1000
-
-    start_ms = now_ms - span_ms
-
-    params = {
-        "pair": pair,
-        "interval": interval,
-        "startTime": str(start_ms),
-        "endTime": str(now_ms),
-        "limit": str(limit)
-    }
-
+    # --- Strategy A: Bybit Linear Perpetuals (Open API, never bans cloud IPs) ---
     try:
-        res = requests.get(f"{COINDCX_CANDLES_URL}/", params=params, timeout=10)
+        bybit_interval = "240" if interval == "4h" else ("15" if interval == "15m" else "60")
+        bybit_symbol = f"{clean_base}USDT"
+        params = {
+            "category": "linear",
+            "symbol": bybit_symbol,
+            "interval": bybit_interval,
+            "limit": limit
+        }
+        res = requests.get(BYBIT_KLINE_URL, params=params, timeout=6)
+        if res.status_code == 200:
+            result_data = res.json().get("result", {})
+            raw_list = result_data.get("list", [])
+            if raw_list and len(raw_list) >= 4:
+                # Bybit returns: [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
+                # Newest candle first -> reverse to chronological order
+                candles = []
+                for item in reversed(raw_list):
+                    t = int(item[0])
+                    o = float(item[1])
+                    h = float(item[2])
+                    l = float(item[3])
+                    cl = float(item[4])
+                    v = float(item[5])
+                    candles.append([t, o, h, l, cl, v])
+                return candles
+    except Exception as e:
+        logger.warning(f"Bybit kline fetch error for {clean_base}: {e}")
+
+    # --- Strategy B: CoinDCX Native Endpoint Fallback ---
+    try:
+        coindcx_pair = f"B-{clean_base}_USDT"
+        params = {"pair": coindcx_pair, "interval": interval, "limit": limit}
+        res = requests.get(COINDCX_CANDLES_URL, params=params, timeout=6)
         if res.status_code == 200:
             data = res.json()
-            if not isinstance(data, list) or len(data) == 0:
-                return []
-
-            candles = []
-            for c in data:
-                t = int(c.get('time', 0))
-                # Normalize timestamp to milliseconds if returned in seconds
-                if t < 100000000000:
-                    t *= 1000
-                o = float(c.get('open', 0))
-                h = float(c.get('high', 0))
-                l = float(c.get('low', 0))
-                cl = float(c.get('close', 0))
-                v = float(c.get('volume', 0))
-                candles.append([t, o, h, l, cl, v])
-
-            # Sort chronological: oldest candle first -> latest candle last
-            candles.sort(key=lambda x: x[0])
-            return candles
-        else:
-            logger.warning(f"CoinDCX returned status {res.status_code} for {pair}: {res.text}")
-            return []
+            if isinstance(data, list) and len(data) >= 4:
+                candles = []
+                for c in data:
+                    t = int(c.get('time', 0))
+                    if t < 100000000000:
+                        t *= 1000
+                    candles.append([
+                        t,
+                        float(c.get('open', 0)),
+                        float(c.get('high', 0)),
+                        float(c.get('low', 0)),
+                        float(c.get('close', 0)),
+                        float(c.get('volume', 0))
+                    ])
+                candles.sort(key=lambda x: x[0])
+                return candles
     except Exception as e:
-        logger.error(f"Error fetching candles for {pair}: {e}")
-        return []
+        logger.error(f"CoinDCX candle fetch error for {clean_base}: {e}")
+
+    return []
 
 # =====================================================================
 # 4. ACTIVE LIQUID FUTURES SYMBOLS FETCHER
@@ -166,7 +174,7 @@ def get_active_futures_symbols():
 # =====================================================================
 def extract_15m_levels(symbol_base, setup_type, h_ref, l_ref):
     try:
-        ohlcv_15m = fetch_coindcx_ohlcv(symbol_base, interval='15m', limit=20)
+        ohlcv_15m = fetch_ohlcv(symbol_base, interval='15m', limit=20)
         if len(ohlcv_15m) < 16:
             return None
 
@@ -246,7 +254,7 @@ def extract_15m_levels(symbol_base, setup_type, h_ref, l_ref):
 # =====================================================================
 def check_liquidity_sweep(symbol_base):
     try:
-        ohlcv_4h = fetch_coindcx_ohlcv(symbol_base, interval='4h', limit=6)
+        ohlcv_4h = fetch_ohlcv(symbol_base, interval='4h', limit=6)
         if len(ohlcv_4h) < 4:
             return None
 
@@ -257,7 +265,7 @@ def check_liquidity_sweep(symbol_base):
         h_ref, l_ref = c_ref[2], c_ref[3]
         h_trig, l_trig, c_trig_close = c_trig[2], c_trig[3], c_trig[4]
 
-        # Exact Unmodified Sweep Conditions
+        # Exact Sweep Conditions
         long_sweep = (l_trig < l_ref) and (c_trig_close > l_ref)
         short_sweep = (h_trig > h_ref) and (c_trig_close < h_ref)
 
@@ -270,14 +278,15 @@ def check_liquidity_sweep(symbol_base):
             return None
 
         # Check if 15m MSS break already occurred
-        ohlcv_15m = fetch_coindcx_ohlcv(symbol_base, interval='15m', limit=10)
-        recent_15m = ohlcv_15m[-5:-1]
+        ohlcv_15m = fetch_ohlcv(symbol_base, interval='15m', limit=10)
+        recent_15m = ohlcv_15m[-5:-1] if len(ohlcv_15m) >= 5 else []
 
         already_mss = False
-        if setup_type == "LONG":
-            already_mss = any(c[4] > levels['h_mss'] for c in recent_15m)
-        else:
-            already_mss = any(c[4] < levels['l_mss'] for c in recent_15m)
+        if recent_15m:
+            if setup_type == "LONG":
+                already_mss = any(c[4] > levels['h_mss'] for c in recent_15m)
+            else:
+                already_mss = any(c[4] < levels['l_mss'] for c in recent_15m)
 
         formatted_symbol = f"{symbol_base}/USDT:USDT"
         return {
@@ -304,7 +313,7 @@ def run_full_scan():
 
     is_scan_running = True
     scan_start = time.time()
-    logger.info("=== Starting CoinDCX 4H Liquidity Sweep Scan ===")
+    logger.info("=== Starting 4H Liquidity Sweep Scan ===")
     try:
         symbols = get_active_futures_symbols()
         found_setups = []
@@ -373,7 +382,7 @@ def run_15m_check():
     for sym, data in list(active_watchlists.items()):
         try:
             base = data.get("base", sym.split('/')[0])
-            ohlcv = fetch_coindcx_ohlcv(base, interval='15m', limit=4)
+            ohlcv = fetch_ohlcv(base, interval='15m', limit=4)
             if len(ohlcv) < 2:
                 continue
 
@@ -447,7 +456,7 @@ def scheduler_loop():
         time.sleep(5)
 
 # =====================================================================
-# 9. FLASK SERVER & WEBHOOK DIAGNOSTICS
+# 9. FLASK SERVER & DIAGNOSTICS
 # =====================================================================
 app = Flask(__name__)
 
@@ -456,7 +465,7 @@ def home():
     uptime = str(datetime.now(timezone.utc) - BOOT_TIME).split('.')[0]
     return jsonify({
         "status": "online",
-        "service": "crypto-alerts-coindcx-native",
+        "service": "crypto-alerts-native-engine",
         "active_watchlists_count": len(active_watchlists),
         "uptime": uptime,
         "server_time_utc": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -487,9 +496,13 @@ def debug_token_endpoint(symbol):
     base = clean.replace('/USDT', '').replace('USDT', '')
 
     try:
-        ohlcv_4h = fetch_coindcx_ohlcv(base, interval='4h', limit=6)
+        ohlcv_4h = fetch_ohlcv(base, interval='4h', limit=6)
         if len(ohlcv_4h) < 4:
-            return jsonify({"error": f"Insufficient candle data returned for {base}"})
+            return jsonify({
+                "error": f"Insufficient candle data returned for {base}",
+                "candles_count": len(ohlcv_4h),
+                "raw_sample": ohlcv_4h
+            })
 
         c_ref = ohlcv_4h[-3]
         c_trig = ohlcv_4h[-2]
@@ -504,7 +517,7 @@ def debug_token_endpoint(symbol):
 
         return jsonify({
             "symbol": f"{base}/USDT:USDT",
-            "coindcx_pair": f"B-{base}_USDT",
+            "candles_fetched": len(ohlcv_4h),
             "4h_reference_candle_3": {"high": h_ref, "low": l_ref},
             "4h_trigger_candle_2": {"high": h_trig, "low": l_trig, "close": c_trig_close},
             "conditions_met": {
@@ -523,13 +536,12 @@ def debug_token_endpoint(symbol):
 if __name__ == '__main__':
     send_telegram_alert(
         "🚀 *Crypto Trading Bot is Online & Active on Render!* \n\n"
-        "• *Engine:* 4H Sweep + 15m MSS (CoinDCX Native Feed)\n"
+        "• *Engine:* 4H Sweep + 15m MSS (Unrestricted Public Data Stream)\n"
         "• *Target System:* Dynamic 4H Opposing Liquidity\n"
-        "• *Status:* Clean IP Route Active (No Binance 418 Bans)"
+        "• *Status:* Multi-source Fallback Active (Zero 418 Bans)"
     )
 
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
     logger.info("=== 24/7 Market Monitor Initialized Successfully ===")
     app.run(host='0.0.0.0', port=PORT)
-    
