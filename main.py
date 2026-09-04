@@ -31,7 +31,7 @@ except Exception:
 
 # CoinDCX Public Endpoints (Bypasses Binance 418 Data-Center IP Bans)
 COINDCX_MARKETS_URL = "https://api.coindcx.com/exchange/v1/markets_details"
-COINDCX_CANDLES_URL = "https://public.coindcx.com/market_data/candles/"
+COINDCX_CANDLES_URL = "https://public.coindcx.com/market_data/candles"
 
 active_watchlists = {}  # {symbol: setup_data_dict}
 processed_sweeps = set()
@@ -65,20 +65,35 @@ def send_telegram_alert(message):
 # =====================================================================
 def fetch_coindcx_ohlcv(symbol_base, interval='4h', limit=25):
     """
-    Fetches raw OHLCV candles from CoinDCX's public endpoint.
+    Fetches raw OHLCV candles from CoinDCX's public candles endpoint using startTime/endTime.
     Format returned: [[timestamp_ms, open, high, low, close, volume], ...] sorted chronologically.
     """
     clean_base = symbol_base.upper().replace('/USDT:USDT', '').replace('/USDT', '').replace('USDT', '')
     pair = f"B-{clean_base}_USDT"
 
+    # Calculate millisecond window required by CoinDCX
+    now_ms = int(time.time() * 1000)
+    if interval == '4h':
+        span_ms = limit * 4 * 3600 * 1000
+    elif interval == '15m':
+        span_ms = limit * 15 * 60 * 1000
+    elif interval == '1h':
+        span_ms = limit * 3600 * 1000
+    else:
+        span_ms = limit * 3600 * 1000
+
+    start_ms = now_ms - span_ms
+
     params = {
         "pair": pair,
         "interval": interval,
-        "limit": limit
+        "startTime": str(start_ms),
+        "endTime": str(now_ms),
+        "limit": str(limit)
     }
 
     try:
-        res = requests.get(COINDCX_CANDLES_URL, params=params, timeout=10)
+        res = requests.get(f"{COINDCX_CANDLES_URL}/", params=params, timeout=10)
         if res.status_code == 200:
             data = res.json()
             if not isinstance(data, list) or len(data) == 0:
@@ -97,7 +112,7 @@ def fetch_coindcx_ohlcv(symbol_base, interval='4h', limit=25):
                 v = float(c.get('volume', 0))
                 candles.append([t, o, h, l, cl, v])
 
-            # Sort ascending: oldest -> latest
+            # Sort chronological: oldest candle first -> latest candle last
             candles.sort(key=lambda x: x[0])
             return candles
         else:
@@ -517,3 +532,4 @@ if __name__ == '__main__':
     t.start()
     logger.info("=== 24/7 Market Monitor Initialized Successfully ===")
     app.run(host='0.0.0.0', port=PORT)
+    
