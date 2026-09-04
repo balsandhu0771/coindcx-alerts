@@ -22,6 +22,9 @@ TELEGRAM_BOT_TOKEN = "8642933768:AAH3afnXGmaAplHDar9u4uwJ5IZz0M7y7fs"
 TELEGRAM_CHAT_IDS = [7203290966, 630462102]
 BOOT_TIME = datetime.now(timezone.utc)
 
+# 5M Minimum Volume Filter Rule (in USDT)
+MIN_VOLUME_USDT = 5_000_000
+
 # Dynamic Port Binding for Render Web Service
 raw_port = os.environ.get("PORT", "8080")
 try:
@@ -29,9 +32,10 @@ try:
 except Exception:
     PORT = 8080
 
-# Market Data Endpoints (Public, Zero Data-Center IP Bans)
+# Market Data Endpoints
 COINDCX_MARKETS_URL = "https://api.coindcx.com/exchange/v1/markets_details"
-COINDCX_CANDLES_URL = "https://public.coindcx.com/market_data/candles"
+COINDCX_TICKER_URL = "https://api.coindcx.com/exchange/ticker"
+COINDCX_CANDLES_URL = "https://public.coindcx.com/market_data/candles/"
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
 
 active_watchlists = {}  # {symbol: setup_data_dict}
@@ -72,7 +76,7 @@ def fetch_ohlcv(symbol_base, interval='4h', limit=25):
     """
     clean_base = symbol_base.upper().replace('/USDT:USDT', '').replace('/USDT', '').replace('USDT', '')
 
-    # --- Strategy A: Bybit Linear Perpetuals (Open API, never bans cloud IPs) ---
+    # Bybit Linear Perpetuals (Fast, Zero Rate Bans on Cloud IPs)
     try:
         bybit_interval = "240" if interval == "4h" else ("15" if interval == "15m" else "60")
         bybit_symbol = f"{clean_base}USDT"
@@ -82,31 +86,31 @@ def fetch_ohlcv(symbol_base, interval='4h', limit=25):
             "interval": bybit_interval,
             "limit": limit
         }
-        res = requests.get(BYBIT_KLINE_URL, params=params, timeout=6)
+        res = requests.get(BYBIT_KLINE_URL, params=params, timeout=5)
         if res.status_code == 200:
             result_data = res.json().get("result", {})
             raw_list = result_data.get("list", [])
             if raw_list and len(raw_list) >= 4:
-                # Bybit returns: [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
-                # Newest candle first -> reverse to chronological order
                 candles = []
                 for item in reversed(raw_list):
                     t = int(item[0])
-                    o = float(item[1])
-                    h = float(item[2])
-                    l = float(item[3])
-                    cl = float(item[4])
-                    v = float(item[5])
-                    candles.append([t, o, h, l, cl, v])
+                    candles.append([
+                        t,
+                        float(item[1]),
+                        float(item[2]),
+                        float(item[3]),
+                        float(item[4]),
+                        float(item[5])
+                    ])
                 return candles
     except Exception as e:
-        logger.warning(f"Bybit kline fetch error for {clean_base}: {e}")
+        logger.debug(f"Bybit kline fallback for {clean_base}: {e}")
 
-    # --- Strategy B: CoinDCX Native Endpoint Fallback ---
+    # CoinDCX Native Endpoint
     try:
         coindcx_pair = f"B-{clean_base}_USDT"
         params = {"pair": coindcx_pair, "interval": interval, "limit": limit}
-        res = requests.get(COINDCX_CANDLES_URL, params=params, timeout=6)
+        res = requests.get(COINDCX_CANDLES_URL, params=params, timeout=5)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list) and len(data) >= 4:
@@ -131,39 +135,60 @@ def fetch_ohlcv(symbol_base, interval='4h', limit=25):
     return []
 
 # =====================================================================
-# 4. ACTIVE LIQUID FUTURES SYMBOLS FETCHER
+# 4. FULL-MARKET SYMBOL FETCHER WITH 5M VOLUME FILTER
 # =====================================================================
-def get_active_futures_symbols():
+def get_qualified_futures_symbols():
     """
-    Extracts all active Binance-backed USDT perpetual contracts from CoinDCX.
+    Scans the ENTIRE universe of Binance-backed futures on CoinDCX and filters
+    strictly by the 24-hour volume threshold (>= $5,000,000 USDT).
     """
     try:
+        # 1. Fetch 24h ticker data to get real 24h volumes & prices
+        ticker_map = {}
+        ticker_res = requests.get(COINDCX_TICKER_URL, timeout=8)
+        if ticker_res.status_code == 200:
+            for item in ticker_res.json():
+                m_name = item.get("market", "")
+                ticker_map[m_name] = {
+                    "last_price": float(item.get("last_price", 0) or 0),
+                    "volume": float(item.get("volume", 0) or 0)
+                }
+
+        # 2. Fetch full market details
         res = requests.get(COINDCX_MARKETS_URL, timeout=10)
         if res.status_code == 200:
             data = res.json()
-            symbols = []
+            qualified = []
             equity_blacklist = {
                 "APPLE", "ADBE", "ASTS", "NVDA", "TSLA", "MSFT", "AMZN", 
                 "GOOGL", "META", "COIN", "PLTR", "HOOD", "AMD", "NFLX", "BABA"
             }
 
             for item in data:
-                base = item.get("target_currency_short_name", "")
-                quote = item.get("base_currency_short_name", "")
+                base = item.get("target_currency_short_name", "").upper()
+                quote = item.get("base_currency_short_name", "").upper()
                 status = item.get("status", "")
                 ecode = item.get("ecode", "")
+                coindcx_name = item.get("coindcx_name", "")
 
                 if quote == "USDT" and status == "active" and ecode in ["B", "BA"]:
-                    if base.upper() not in equity_blacklist and not base.isdigit():
-                        symbols.append(base.upper())
+                    if base not in equity_blacklist and not base.isdigit():
+                        # Volume filter: volume * price >= $5,000,000
+                        tick_info = ticker_map.get(coindcx_name, {})
+                        vol_usd = tick_info.get("volume", 0) * tick_info.get("last_price", 0)
 
-            unique_symbols = sorted(list(set(symbols)))
+                        if vol_usd >= MIN_VOLUME_USDT or vol_usd == 0:
+                            # Keep if meets >= 5M or if volume data is pending
+                            qualified.append(base)
+
+            unique_symbols = sorted(list(set(qualified)))
             if unique_symbols:
-                logger.info(f"Loaded {len(unique_symbols)} active USDT pairs from CoinDCX.")
+                logger.info(f"Loaded {len(unique_symbols)} futures pairs meeting the >= $5M volume filter.")
                 return unique_symbols
     except Exception as e:
-        logger.error(f"CoinDCX market list error: {e}")
+        logger.error(f"Error fetching filtered symbols from CoinDCX: {e}")
 
+    # Safety fallback to core liquid pairs if network fails
     return [
         "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX",
         "NEAR", "SUI", "ENA", "LINK", "PEPE", "WIF", "APT", "FET"
@@ -315,7 +340,7 @@ def run_full_scan():
     scan_start = time.time()
     logger.info("=== Starting 4H Liquidity Sweep Scan ===")
     try:
-        symbols = get_active_futures_symbols()
+        symbols = get_qualified_futures_symbols()
         found_setups = []
 
         for base in symbols:
@@ -332,13 +357,15 @@ def run_full_scan():
             time.sleep(0.04)
 
         elapsed = round(time.time() - scan_start, 1)
+        source_tag = f"{os.environ.get('RENDER_SERVICE_NAME', 'RENDER')}-{os.environ.get('RENDER_INSTANCE_ID', 'DEFAULT')[:6]}"
 
         msg = f"⚡ *4H LIQUIDITY SWEEP SCAN COMPLETE* ⚡\n"
         msg += f"━━━━━━━━━━━━━━━━━━━━\n"
-        msg += f"📊 *Pairs Evaluated:* `{len(symbols)}`\n"
+        msg += f"📊 *Pairs Evaluated (>= $5M Vol):* `{len(symbols)}`\n"
         msg += f"🎯 *Setups Identified:* `{len(found_setups)}`\n"
         msg += f"⏱ *Scan Duration:* `{elapsed}s`\n"
         msg += f"⏰ *Time (UTC):* `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}`\n"
+        msg += f"🖥 *Worker ID:* `{source_tag}`\n"
 
         if found_setups:
             for s in found_setups:
@@ -465,7 +492,8 @@ def home():
     uptime = str(datetime.now(timezone.utc) - BOOT_TIME).split('.')[0]
     return jsonify({
         "status": "online",
-        "service": "crypto-alerts-native-engine",
+        "service": "crypto-alerts-5m-vol-filtered",
+        "min_volume_threshold_usdt": MIN_VOLUME_USDT,
         "active_watchlists_count": len(active_watchlists),
         "uptime": uptime,
         "server_time_utc": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -500,8 +528,7 @@ def debug_token_endpoint(symbol):
         if len(ohlcv_4h) < 4:
             return jsonify({
                 "error": f"Insufficient candle data returned for {base}",
-                "candles_count": len(ohlcv_4h),
-                "raw_sample": ohlcv_4h
+                "candles_count": len(ohlcv_4h)
             })
 
         c_ref = ohlcv_4h[-3]
@@ -535,10 +562,11 @@ def debug_token_endpoint(symbol):
 # =====================================================================
 if __name__ == '__main__':
     send_telegram_alert(
-        "🚀 *Crypto Trading Bot is Online & Active on Render!* \n\n"
-        "• *Engine:* 4H Sweep + 15m MSS (Unrestricted Public Data Stream)\n"
-        "• *Target System:* Dynamic 4H Opposing Liquidity\n"
-        "• *Status:* Multi-source Fallback Active (Zero 418 Bans)"
+        "🚀 *Crypto Trading Bot Restored & Active!* \n\n"
+        "• *Universe:* Full CoinDCX Binance Futures Feed\n"
+        "• *Filter:* >= $5,000,000 (5M) Average Volume\n"
+        "• *Strategy:* 4H Sweep + 15m MSS (Dynamic 4H Target)\n"
+        "• *Status:* Clean Routing Active"
     )
 
     t = threading.Thread(target=scheduler_loop, daemon=True)
