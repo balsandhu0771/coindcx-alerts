@@ -232,6 +232,9 @@ def extract_15m_levels(symbol_base, setup_type, h_ref, l_ref):
                 return None
 
             rr_ratio = round(reward / risk, 2)
+            if rr_ratio < 0.95:
+                return None
+
             return {
                 "l_min": l_min,
                 "h_mss": h_mss,
@@ -264,6 +267,9 @@ def extract_15m_levels(symbol_base, setup_type, h_ref, l_ref):
                 return None
 
             rr_ratio = round(reward / risk, 2)
+            if rr_ratio < 0.95:
+                return None
+
             return {
                 "h_max": h_max,
                 "l_mss": l_mss,
